@@ -101,7 +101,19 @@ def fn_smooth(x, y, value):
 
 
 def fn_derivative(x, y, value):
-    """dY/dX at each point."""
+    """dY/dX at each point. With an X range typed ("400, 600"), only that
+    part of the curve is kept and differentiated."""
+    rng = _numbers(value)
+    if rng:
+        if len(rng) != 2:
+            raise ValueError("Type two X values for the range, e.g. 400, 600 "
+                             "(blank = whole curve).")
+        lo, hi = sorted(rng)
+        keep = (x >= lo) & (x <= hi)
+        if keep.sum() < 2:
+            raise ValueError(f"Fewer than 2 points between {lo:g} and {hi:g} "
+                             f"(the data covers {x.min():g} to {x.max():g}).")
+        x, y = x[keep], y[keep]
     if len(x) < 2:
         raise ValueError("Need at least 2 points for a derivative.")
     return x, np.gradient(y, x)
@@ -360,7 +372,9 @@ FUNCTIONS = {
                                      default="", tag=""),
     "Add offset":               dict(kind="each", fn=fn_offset, hint="Offset", default="0.1", tag="+{v}"),
     "Smooth (moving average)":  dict(kind="each", fn=fn_smooth, hint="Window (number of points)", default="5", tag="smooth {v}"),
-    "1st derivative":           dict(kind="each", fn=fn_derivative, hint=None, default="", tag="d/dx"),
+    "1st derivative":           dict(kind="each", fn=fn_derivative,
+                                     hint="X range, e.g. 400, 600 (blank = whole curve)",
+                                     default="", tag="d/dx {v}"),
     "Global min / max":         dict(kind="multi", fn=multi_extremes,
                                      hint="Smoothing window, points (1 = none)",
                                      default="5", tag=""),
@@ -468,7 +482,7 @@ class WorkingSet:
                 # compute everything first so one failure leaves nothing half-done
                 results = {k: spec["fn"](self.items[k]["x"], self.items[k]["y"], value)
                            for k in keys}
-                tag = spec["tag"].format(v=value)
+                tag = spec["tag"].format(v=value).strip()
                 for k, (x, y) in results.items():
                     self.items[k]["x"] = np.asarray(x, float)
                     self.items[k]["y"] = np.asarray(y, float)
