@@ -107,14 +107,25 @@ def fn_derivative(x, y, value):
     return x, np.gradient(y, x)
 
 
-def report_extremes(ws, key):
-    """Global maximum and minimum of an item (after the function), for the
-    Results box and the log."""
-    x, y = ws.items[key]["x"], ws.items[key]["y"]
-    i, j = int(np.argmax(y)), int(np.argmin(y))
-    ws.details.append(dict(item=key, result=ws.label(key),
-                           max_x=x[i], max=y[i], min_x=x[j], min=y[j]))
-    return f"{key}: max {y[i]:.4g} at X = {x[i]:g}, min {y[j]:.4g} at X = {x[j]:g}"
+# ---- Global min / max (report only, the curves aren't changed) -------------
+def multi_extremes(ws, keys, value):
+    """Print the global maximum and minimum of each item and where they are.
+    With a window of N points, a smoothed copy (moving average) is searched so
+    single noisy points don't count; the item itself isn't changed."""
+    n = int(round(_num(value, "the window size"))) if value else 1
+    if n < 1:
+        raise ValueError("The window must be 1 (no smoothing) or more points.")
+    lines = []
+    for key in keys:
+        x, y = ws.items[key]["x"], ws.items[key]["y"]
+        if n > 1:
+            y = fn_smooth(x, y, str(n))[1]
+        i, j = int(np.argmax(y)), int(np.argmin(y))
+        ws.details.append(dict(item=key, result=f"smoothed over {n} points" if n > 1 else "",
+                               max_x=x[i], max=y[i], min_x=x[j], min=y[j]))
+        lines.append(f"{key}\n  max {y[i]:.4g} at X = {x[i]:.5g}"
+                     f"\n  min {y[j]:.4g} at X = {x[j]:.5g}")
+    return "\n".join(lines)
 
 
 # ---- Average (several items -> one new item) -------------------------------
@@ -336,8 +347,6 @@ def multi_tauc(ws, keys, value, kind):
 # kind:  "each" = applied to every item, "multi" = uses several items / makes new ones
 # hint:  label for the Value box (None = box not used)
 # tag:   added to the item's name so you can see what was done; {v} = value
-# report (optional, "each" only): called as report(ws, key) on each item
-#        afterwards; returns a line for the Results box
 FUNCTIONS = {
     "Average":                  dict(kind="multi", fn=multi_average, hint=None, default="", tag=""),
     "Deconvolution (Gaussian)": dict(kind="multi", fn=multi_deconvolve,
@@ -351,8 +360,10 @@ FUNCTIONS = {
                                      default="", tag=""),
     "Add offset":               dict(kind="each", fn=fn_offset, hint="Offset", default="0.1", tag="+{v}"),
     "Smooth (moving average)":  dict(kind="each", fn=fn_smooth, hint="Window (number of points)", default="5", tag="smooth {v}"),
-    "1st derivative":           dict(kind="each", fn=fn_derivative, hint=None, default="", tag="d/dx",
-                                     report=report_extremes),
+    "1st derivative":           dict(kind="each", fn=fn_derivative, hint=None, default="", tag="d/dx"),
+    "Global min / max":         dict(kind="multi", fn=multi_extremes,
+                                     hint="Smoothing window, points (1 = none)",
+                                     default="5", tag=""),
 }
 
 
@@ -462,8 +473,6 @@ class WorkingSet:
                     self.items[k]["x"] = np.asarray(x, float)
                     self.items[k]["y"] = np.asarray(y, float)
                     self.items[k]["ops"].append(tag)
-                if spec.get("report"):
-                    report = "\n".join(spec["report"](self, k) for k in results)
         except Exception:
             self.items = self._history.pop()[0]   # roll back
             raise
@@ -551,8 +560,11 @@ class App(tk.Tk):
     def __init__(self, start_file=None):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1450x880")
-        self.minsize(1100, 650)
+        # 1450 x 880, or smaller so the whole window fits on the screen
+        w = min(1450, self.winfo_screenwidth() - 40)
+        h = min(880, self.winfo_screenheight() - 100)
+        self.geometry(f"{w}x{h}+10+10")
+        self.minsize(min(1100, w), min(650, h))
 
         self.tables = {}
         self.df = None
@@ -588,21 +600,26 @@ class App(tk.Tk):
                    command=self.choose_file).pack(fill="x")
         self.file_label = ttk.Label(side, text="No file loaded", wraplength=230,
                                     foreground="#666")
-        self.file_label.pack(fill="x", pady=(4, 8))
+        self.file_label.pack(fill="x", pady=(2, 4))
 
-        ttk.Label(side, text="Sheet").pack(anchor="w")
-        self.sheet_box = ttk.Combobox(side, state="readonly", width=30)
-        self.sheet_box.pack(fill="x", pady=(0, 6))
+        pick = ttk.Frame(side)                # sheet and X column, label beside the box
+        pick.pack(fill="x", pady=(0, 4))
+        pick.columnconfigure(1, weight=1)
+        ttk.Label(pick, text="Sheet").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.sheet_box = ttk.Combobox(pick, state="readonly", width=22)
+        self.sheet_box.grid(row=0, column=1, sticky="ew", pady=1)
         self.sheet_box.bind("<<ComboboxSelected>>", lambda e: self.on_sheet_change())
-
-        ttk.Label(side, text="X column (wavelength)").pack(anchor="w")
-        self.x_box = ttk.Combobox(side, state="readonly", width=30)
-        self.x_box.pack(fill="x", pady=(0, 6))
+        ttk.Label(pick, text="X (nm)").grid(row=1, column=0, sticky="w", padx=(0, 6))
+        self.x_box = ttk.Combobox(pick, state="readonly", width=22)
+        self.x_box.grid(row=1, column=1, sticky="ew", pady=1)
         self.x_box.bind("<<ComboboxSelected>>", lambda e: self.on_x_change())
 
         ttk.Label(side, text="Y columns (click to show on graph)").pack(anchor="w")
+        lower = ttk.Frame(side)               # packed first so the list shrinks, not this
+        lower.pack(side="bottom", fill="x")
         self.y_list = self._listbox(side, "multiple")
         self.y_list.bind("<<ListboxSelect>>", lambda e: self.redraw())
+        side = lower
 
         row = ttk.Frame(side)
         row.pack(fill="x", pady=(4, 2))
@@ -611,7 +628,7 @@ class App(tk.Tk):
         ttk.Button(row, text="None", command=lambda: self.select_y(False)
                    ).pack(side="left", expand=True, fill="x")
         ttk.Button(side, text="Move selected to working list  →",
-                   command=self.move_to_working).pack(fill="x", pady=(2, 8))
+                   command=self.move_to_working).pack(fill="x", pady=(2, 4))
 
         g = ttk.LabelFrame(side, text="Graph", padding=(8, 4))
         g.pack(fill="x", pady=(4, 0))
@@ -620,7 +637,7 @@ class App(tk.Tk):
 
         def entry(var, row, col, span=1):
             e = ttk.Entry(g, textvariable=var, width=7)
-            e.grid(row=row, column=col, columnspan=span, sticky="ew", pady=2)
+            e.grid(row=row, column=col, columnspan=span, sticky="ew", pady=1)
             e.bind("<Return>", lambda ev: self.redraw())
             e.bind("<FocusOut>", lambda ev: self.redraw())
 
@@ -681,9 +698,12 @@ class App(tk.Tk):
         ttk.Label(side, text="Functions apply to the selected items,\n"
                              "or to all items if none are selected.",
                   foreground="#666").pack(anchor="w", pady=(0, 4))
+        lower = ttk.Frame(side)               # packed first so the list shrinks, not this
+        lower.pack(side="bottom", fill="x")
         self.w_list = self._listbox(side, "extended", width=36)
         self.w_list.bind("<<ListboxSelect>>", lambda e: self._update_target_label())
         self.w_list.bind("<Double-Button-1>", lambda e: self.rename_item())
+        side = lower
 
         row = ttk.Frame(side)
         row.pack(fill="x", pady=(4, 8))
@@ -1021,8 +1041,12 @@ class App(tk.Tk):
                                result=self.ws.label(k) if k in self.ws.items else "")
         if report:
             header = name + (f" ({value})" if value else "")
-            self.results.insert("end", f"{header}\n{report}\n\n")
+            if self.results.get("1.0", "end-1c"):
+                self.results.insert("end", "\n\n")
+            start = self.results.index("end-1c")
+            self.results.insert("end", f"{header}\n{report}")
             self.results.see("end")
+            self.results.see(start)               # newest result, from its first line
         self.refresh_working()
         self.redraw()
 
