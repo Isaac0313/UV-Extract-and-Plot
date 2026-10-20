@@ -49,7 +49,8 @@ TAUC_YLIM = ("0", "6")
 
 # Columns of the function log CSV
 LOG_COLUMNS = ["Time", "File", "Action", "Item", "Value", "Result",
-               "Peak", "Center", "Height", "FWHM", "Area", "Baseline", "Eg", "R2"]
+               "Peak", "Center", "Height", "FWHM", "Area", "Baseline", "Eg", "R2",
+               "Max X", "Max", "Min X", "Min"]
 
 STYLES = {
     "Line": dict(linestyle="-", marker=""),
@@ -104,6 +105,16 @@ def fn_derivative(x, y, value):
     if len(x) < 2:
         raise ValueError("Need at least 2 points for a derivative.")
     return x, np.gradient(y, x)
+
+
+def report_extremes(ws, key):
+    """Global maximum and minimum of an item (after the function), for the
+    Results box and the log."""
+    x, y = ws.items[key]["x"], ws.items[key]["y"]
+    i, j = int(np.argmax(y)), int(np.argmin(y))
+    ws.details.append(dict(item=key, result=ws.label(key),
+                           max_x=x[i], max=y[i], min_x=x[j], min=y[j]))
+    return f"{key}: max {y[i]:.4g} at X = {x[i]:g}, min {y[j]:.4g} at X = {x[j]:g}"
 
 
 # ---- Average (several items -> one new item) -------------------------------
@@ -325,6 +336,8 @@ def multi_tauc(ws, keys, value, kind):
 # kind:  "each" = applied to every item, "multi" = uses several items / makes new ones
 # hint:  label for the Value box (None = box not used)
 # tag:   added to the item's name so you can see what was done; {v} = value
+# report (optional, "each" only): called as report(ws, key) on each item
+#        afterwards; returns a line for the Results box
 FUNCTIONS = {
     "Average":                  dict(kind="multi", fn=multi_average, hint=None, default="", tag=""),
     "Deconvolution (Gaussian)": dict(kind="multi", fn=multi_deconvolve,
@@ -338,7 +351,8 @@ FUNCTIONS = {
                                      default="", tag=""),
     "Add offset":               dict(kind="each", fn=fn_offset, hint="Offset", default="0.1", tag="+{v}"),
     "Smooth (moving average)":  dict(kind="each", fn=fn_smooth, hint="Window (number of points)", default="5", tag="smooth {v}"),
-    "1st derivative":           dict(kind="each", fn=fn_derivative, hint=None, default="", tag="d/dx"),
+    "1st derivative":           dict(kind="each", fn=fn_derivative, hint=None, default="", tag="d/dx",
+                                     report=report_extremes),
 }
 
 
@@ -448,6 +462,8 @@ class WorkingSet:
                     self.items[k]["x"] = np.asarray(x, float)
                     self.items[k]["y"] = np.asarray(y, float)
                     self.items[k]["ops"].append(tag)
+                if spec.get("report"):
+                    report = "\n".join(spec["report"](self, k) for k in results)
         except Exception:
             self.items = self._history.pop()[0]   # roll back
             raise
@@ -1110,7 +1126,7 @@ class App(tk.Tk):
         row = dict.fromkeys(LOG_COLUMNS, "")
         row.update(Time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                    File=self.file_name, Action=action)
-        names = {"fwhm": "FWHM", "r2": "R2"}
+        names = {"fwhm": "FWHM", "r2": "R2", "max_x": "Max X", "min_x": "Min X"}
         for key, val in fields.items():
             col = names.get(key, key.capitalize())
             if isinstance(val, (float, np.floating)):
