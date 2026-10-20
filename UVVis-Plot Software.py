@@ -26,7 +26,7 @@ import copy
 import os
 import sys
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import ttk, filedialog, messagebox, simpledialog, colorchooser
 
 import numpy as np
 import pandas as pd
@@ -531,21 +531,23 @@ def load_tables(path):
 
 def draw_plot(ax, series, style="Line", log_y=False, grid=True,
               title="", x_label="", y_label="", xlim=(None, None), ylim=(None, None)):
-    """series = list of (label, x, y, look), look = "original", "working" or "fit".
+    """series = list of (label, x, y, look) or (label, x, y, look, color),
+    look = "original", "working" or "fit"; color None = automatic.
     xlim / ylim = (min, max); None = automatic. min > max flips the axis.
     Returns number of lines drawn."""
     ax.clear()
     drawn = 0
-    for label, x, y, look in series:
+    for label, x, y, look, *color in series:
+        color = color[0] if color else None
         x = pd.to_numeric(pd.Series(list(x)), errors="coerce")
         y = pd.to_numeric(pd.Series(list(y)), errors="coerce")
         ok = x.notna() & y.notna()          # skip blanks and text cells
         if ok.sum() == 0:
             continue
         if look == "fit":                    # deconvolution peaks / total fit
-            ax.plot(x[ok], y[ok], label=label, linewidth=1.2, linestyle="--")
+            ax.plot(x[ok], y[ok], label=label, linewidth=1.2, linestyle="--", color=color)
         else:
-            ax.plot(x[ok], y[ok], label=label,
+            ax.plot(x[ok], y[ok], label=label, color=color,
                     linewidth=2.0 if look == "working" else 1.2, **STYLES[style])
         drawn += 1
 
@@ -586,6 +588,7 @@ class App(tk.Tk):
         self.ws = WorkingSet()
         self.log = []              # rows for the function log CSV
         self.file_name = ""
+        self.colors = {}           # colour groups: Y column name -> colour
 
         self._build_header()
         self._build_left_panel()
@@ -632,14 +635,19 @@ class App(tk.Tk):
         lower = ttk.Frame(side)               # packed first so the list shrinks, not this
         lower.pack(side="bottom", fill="x")
         self.y_list = self._listbox(side, "multiple")
+        self.y_list.config(selectbackground="#cfe0f5", selectforeground="black")
         self.y_list.bind("<<ListboxSelect>>", lambda e: self.redraw())
         side = lower
 
         row = ttk.Frame(side)
         row.pack(fill="x", pady=(4, 2))
-        ttk.Button(row, text="All", command=lambda: self.select_y(True)
+        ttk.Button(row, text="All", command=lambda: self.select_y(True), width=1
                    ).pack(side="left", expand=True, fill="x")
-        ttk.Button(row, text="None", command=lambda: self.select_y(False)
+        ttk.Button(row, text="None", command=lambda: self.select_y(False), width=1
+                   ).pack(side="left", expand=True, fill="x")
+        ttk.Button(row, text="Colour...", command=self.color_group, width=1
+                   ).pack(side="left", expand=True, fill="x")
+        ttk.Button(row, text="Ungroup", command=self.ungroup, width=1
                    ).pack(side="left", expand=True, fill="x")
         ttk.Button(side, text="Move selected to working list  →",
                    command=self.move_to_working).pack(fill="x", pady=(2, 4))
@@ -823,6 +831,7 @@ class App(tk.Tk):
 
         self.tables = tables
         self.ws = WorkingSet()                # new file -> empty working list
+        self.colors = {}
         self.refresh_working()
         self.file_name = os.path.basename(path)
         self.file_label.config(text=self.file_name)
@@ -860,8 +869,47 @@ class App(tk.Tk):
         self.y_list.delete(0, "end")
         for i, name in enumerate(self.y_names):
             self.y_list.insert("end", name)
+            color = self.colors.get(self.key_for(name))
+            if color:
+                self.y_list.itemconfig(i, foreground=color, selectforeground=color)
             if select_all or name in keep:
                 self.y_list.select_set(i)
+
+    def color_group(self):
+        """Give the selected Y columns one colour on the graph."""
+        cols = [self.y_names[i] for i in self.y_list.curselection()]
+        if not cols:
+            messagebox.showinfo("Colour group", "Select the Y columns to group first.")
+            return
+        color = colorchooser.askcolor(title=f"Colour for {len(cols)} column(s)",
+                                      initialcolor=self.colors.get(self.key_for(cols[0])),
+                                      parent=self)[1]
+        if not color:
+            return
+        for col in cols:
+            self.colors[self.key_for(col)] = color
+        self.log_event("Colour group", item=", ".join(cols), result=color)
+        self.refresh_available()
+        self.redraw()
+
+    def _free_colors(self):
+        """Default line colours, minus those close to a colour group's, so an
+        ungrouped line doesn't look like part of a group."""
+        from matplotlib import rcParams
+        from matplotlib.colors import to_rgb
+        used = [to_rgb(c) for c in set(self.colors.values())]
+        cycle = rcParams["axes.prop_cycle"].by_key()["color"]
+        free = [c for c in cycle
+                if all(np.abs(np.subtract(to_rgb(c), u)).sum() > 0.45 for u in used)]
+        return free or cycle
+
+    def ungroup(self):
+        """Selected Y columns go back to automatic colours."""
+        cols = [self.y_names[i] for i in self.y_list.curselection()]
+        for col in cols:
+            self.colors.pop(self.key_for(col), None)
+        self.refresh_available()
+        self.redraw()
 
     def refresh_working(self):
         keep = set(self.selected_work_keys())
@@ -1069,13 +1117,15 @@ class App(tk.Tk):
         if self.df is None:
             return
         x_col = self.x_box.get()
-        series = [(c, self.df[x_col], self.df[c], "original")
+        series = [(c, self.df[x_col], self.df[c], "original", self.colors.get(self.key_for(c)))
                   for c in (self.y_names[i] for i in self.y_list.curselection())]
         work = [(self.ws.label(k), it["x"], it["y"],
                  "fit" if it.get("dashed") else "working", it.get("tauc"))
                 for k, it in self.ws.items.items()]
         series += [w[:4] for w in work if not w[4]]
         tauc = [w for w in work if w[4]]
+        free = iter(self._free_colors() * 50)
+        series = [(*s[:4], s[4] if len(s) > 4 and s[4] else next(free)) for s in series]
         self._set_panels(bool(tauc))
         self.ax.set_axis_on()
         self.ax.set_yscale("linear")
