@@ -42,6 +42,11 @@ APP_SUBTITLE = "Spectra plotting and parameter extraction"
 HEADER_COLOR = "#1f3b57"        # background of the header band
 HEADER_TEXT_COLOR = "#ffffff"
 
+# Starting axis ranges of the Tauc plot graph (min, max); "" = automatic.
+# They can be changed in the Graph panel while the program runs.
+TAUC_XLIM = ("0", "3.0")      # photon energy, eV
+TAUC_YLIM = ("0", "250")
+
 # Columns of the function log CSV
 LOG_COLUMNS = ["Time", "File", "Action", "Item", "Value", "Result",
                "Peak", "Center", "Height", "FWHM", "Area", "Baseline", "Eg", "R2"]
@@ -616,27 +621,31 @@ class App(tk.Tk):
         # axis ranges: min "to" max, blank = automatic
         self.xmin_var, self.xmax_var, self.ymin_var, self.ymax_var = (
             tk.StringVar() for _ in range(4))
+        self.tauc_xmin_var, self.tauc_xmax_var = (tk.StringVar(value=v) for v in TAUC_XLIM)
+        self.tauc_ymin_var, self.tauc_ymax_var = (tk.StringVar(value=v) for v in TAUC_YLIM)
         for row, text, lo, hi in ((3, "X range", self.xmin_var, self.xmax_var),
-                                  (4, "Y range", self.ymin_var, self.ymax_var)):
+                                  (4, "Y range", self.ymin_var, self.ymax_var),
+                                  (5, "Tauc X", self.tauc_xmin_var, self.tauc_xmax_var),
+                                  (6, "Tauc Y", self.tauc_ymin_var, self.tauc_ymax_var)):
             label(text, row)
             entry(lo, row, 1)
             ttk.Label(g, text="to").grid(row=row, column=2, padx=4)
             entry(hi, row, 3)
         ttk.Label(g, text="Blank = automatic. Put the larger X first to flip it.",
                   foreground="#666", font=("TkDefaultFont", 8)
-                  ).grid(row=5, column=0, columnspan=4, sticky="w")
+                  ).grid(row=7, column=0, columnspan=4, sticky="w")
 
-        label("Style", 6)
+        label("Style", 8)
         self.style_var = tk.StringVar(value="Line")
         style_box = ttk.Combobox(g, state="readonly", values=list(STYLES),
                                  textvariable=self.style_var, width=7)
-        style_box.grid(row=6, column=1, columnspan=3, sticky="ew", pady=2)
+        style_box.grid(row=8, column=1, columnspan=3, sticky="ew", pady=2)
         style_box.bind("<<ComboboxSelected>>", lambda e: self.redraw())
 
         self.log_var = tk.BooleanVar(value=False)
         self.grid_var = tk.BooleanVar(value=True)
         checks = ttk.Frame(g)
-        checks.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(2, 2))
+        checks.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(2, 2))
         ttk.Checkbutton(checks, text="Log Y", variable=self.log_var,
                         command=self.redraw).pack(side="left")
         ttk.Checkbutton(checks, text="Grid", variable=self.grid_var,
@@ -1030,7 +1039,11 @@ class App(tk.Tk):
                        r"$(\alpha h\nu)^{1/n}$")
             draw_plot(self.ax_tauc, [w[:4] for w in tauc],
                       style=self.style_var.get(), grid=self.grid_var.get(),
-                      title="Tauc plot", x_label="Photon energy (eV)", y_label=y_label)
+                      title="Tauc plot", x_label="Photon energy (eV)", y_label=y_label,
+                      xlim=(self._axis_value(self.tauc_xmin_var),
+                            self._axis_value(self.tauc_xmax_var)),
+                      ylim=(self._axis_value(self.tauc_ymin_var),
+                            self._axis_value(self.tauc_ymax_var)))
             self.ax_tauc.axhline(0, color="#888", linewidth=0.8)
         self.canvas.draw_idle()
 
@@ -1055,7 +1068,9 @@ class App(tk.Tk):
             return None
 
     def reset_axes(self):
-        for var in (self.xmin_var, self.xmax_var, self.ymin_var, self.ymax_var):
+        for var in (self.xmin_var, self.xmax_var, self.ymin_var, self.ymax_var,
+                    self.tauc_xmin_var, self.tauc_xmax_var,
+                    self.tauc_ymin_var, self.tauc_ymax_var):
             var.set("")
         self.redraw()
 
