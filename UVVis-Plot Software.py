@@ -188,7 +188,7 @@ def multi_deconvolve(ws, keys, value):
         it = ws.items[key]
         x, y = it["x"], it["y"]
         typed = _numbers(value)
-        centers = typed or _auto_peak_guesses(x, y)
+        centers = typed or _auto_peak_guesses(x, y)[:max(1, (len(x) - 2) // 3)]
         bad = [c for c in centers if not x.min() <= c <= x.max()]
         if bad:
             raise ValueError(f"Peak guess {bad[0]:g} is outside the data of '{key}' "
@@ -224,8 +224,8 @@ def multi_deconvolve(ws, keys, value):
                                  f"peak positions in the Value box.")
             p = best
 
-        fit = _gauss_sum(x, *p)
-        ss_res = np.sum((y - fit) ** 2)
+        total = _gauss_sum(x, *p)
+        ss_res = np.sum((y - total) ** 2)
         ss_tot = np.sum((y - y.mean()) ** 2)
         r2 = 1 - ss_res / ss_tot if ss_tot else float("nan")
 
@@ -242,7 +242,7 @@ def multi_deconvolve(ws, keys, value):
                          f"{GAUSS_FWHM * abs(sigma):>9.2f} {area:>10.4g}")
             ws.new_item(f"{key} peak {n} @ {center:.0f}",          # drawn on the baseline
                         x, p[0] + _gauss(x, amp, center, sigma), dashed=True)
-        ws.new_item(f"{key} fit", x, fit, dashed=True)
+        ws.new_item(f"{key} fit", x, total, dashed=True)
         report.append("\n".join(lines))
     return "\n".join(report)
 
@@ -294,6 +294,7 @@ class WorkingSet:
             raise ValueError(f"There is already an item called '{new}'.")
         self.items = {(new if k == old else k): v for k, v in self.items.items()}
         self.items[new]["ops"] = []
+        self.items[new]["renamed"] = True
 
     def unique_key(self, base):
         key, n = base, 2
@@ -318,7 +319,8 @@ class WorkingSet:
         return None
 
     def add(self, key, x, y):
-        """Copy a column in: numbers only, sorted by X, duplicate X removed."""
+        """Copy a column in: numbers only, sorted by X, duplicate X removed.
+        Returns the item's name (made unique if 'key' is already taken)."""
         x = pd.to_numeric(pd.Series(list(x)), errors="coerce").to_numpy(float)
         y = pd.to_numeric(pd.Series(list(y)), errors="coerce").to_numpy(float)
         ok = ~np.isnan(x) & ~np.isnan(y)
@@ -328,7 +330,9 @@ class WorkingSet:
         order = np.argsort(x, kind="stable")
         x, y = x[order], y[order]
         x, first = np.unique(x, return_index=True)
-        self.items[key] = dict(x=x, y=y[first], ops=[], dashed=False, source=key)
+        name = self.unique_key(key)
+        self.items[name] = dict(x=x, y=y[first], ops=[], dashed=False, source=key)
+        return name
 
     def new_item(self, base_name, x, y, dashed=False):
         """Add a result (average, fitted peak...) as a new item."""
@@ -392,7 +396,14 @@ def load_tables(path):
     cleaned = {}
     for name, df in tables.items():
         df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
-        df.columns = [str(c).strip() for c in df.columns]
+        names = []
+        for c in df.columns:
+            base = name_ = str(c).strip()
+            n = 2
+            while name_ in names:
+                name_, n = f"{base} #{n}", n + 1
+            names.append(name_)
+        df.columns = names
         if df.shape[1] >= 2 and len(df) > 0:
             cleaned[str(name)] = df
     return cleaned
@@ -750,8 +761,8 @@ class App(tk.Tk):
         skipped = []
         for col in cols:
             try:
-                self.ws.add(self.key_for(col), x, self.df[col])
-                self.log_event("Move to working list", item=self.key_for(col))
+                key = self.ws.add(self.key_for(col), x, self.df[col])
+                self.log_event("Move to working list", item=key)
             except ValueError:
                 skipped.append(col)
         if skipped:
@@ -775,7 +786,7 @@ class App(tk.Tk):
         added, failed = [], []
         for k in keys:
             it = self.ws.items[k]
-            if it.get("source") == k and not it["ops"]:
+            if it.get("source") and not it["ops"] and not it.get("renamed"):
                 self.log_event("Move to Y columns", item=k, result="original column")
                 continue
             # put the item's values on this sheet's X points (blank outside its range)
@@ -819,7 +830,7 @@ class App(tk.Tk):
         new = simpledialog.askstring("Rename", "New name (shown in the legend):",
                                      initialvalue=self.ws.label(old).replace("  [", " ["),
                                      parent=self)
-        if new is None or new.strip() == old:
+        if new is None or (new.strip() == old and not self.ws.items[old]["ops"]):
             return
         self.ws.checkpoint()
         try:
@@ -847,6 +858,9 @@ class App(tk.Tk):
                 if sheet in self.tables:
                     self.tables[sheet] = self.tables[sheet][cols]
             self.df = self.tables[self.sheet_box.get()]
+            if self.x_box.get() not in self.df.columns:
+                self.on_sheet_change()
+        self.w_list.selection_clear(0, "end")
         self.log_event("Undo")
         self.refresh_available()
         self.refresh_working()
