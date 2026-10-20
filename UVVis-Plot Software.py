@@ -44,7 +44,7 @@ HEADER_TEXT_COLOR = "#ffffff"
 
 # Columns of the function log CSV
 LOG_COLUMNS = ["Time", "File", "Action", "Item", "Value", "Result",
-               "Peak", "Center", "Height", "FWHM", "Area", "Baseline", "R2"]
+               "Peak", "Center", "Height", "FWHM", "Area", "Baseline", "Eg", "R2"]
 
 STYLES = {
     "Line": dict(linestyle="-", marker=""),
@@ -108,15 +108,16 @@ def multi_average(ws, keys, value):
     if len(keys) < 2:
         raise ValueError("Needs at least 2 items to average.")
     items = [ws.items[k] for k in keys]
+    if len({it.get("tauc", "") for it in items}) > 1:
+        raise ValueError("Can't average Tauc plot items with spectra (different X units).")
     lo = max(it["x"].min() for it in items)
     hi = min(it["x"].max() for it in items)
     x = items[0]["x"][(items[0]["x"] >= lo) & (items[0]["x"] <= hi)]
     if len(x) == 0:
         raise ValueError("These items don't share any X range.")
     y = np.mean([np.interp(x, it["x"], it["y"]) for it in items], axis=0)
-    new = ws.new_item(f"Average of {len(keys)}", x, y)
+    new = ws.new_item(f"Average of {len(keys)}", x, y, tauc=items[0].get("tauc", ""))
     ws.details.append(dict(item=", ".join(keys), result=f"created '{new}'"))
-    return f"Averaged into '{new}': " + ", ".join(keys)
 
 
 # ---- Deconvolution (Gaussian peak fitting) ---------------------------------
@@ -241,10 +242,78 @@ def multi_deconvolve(ws, keys, value):
             lines.append(f"  {n:>2} {center:>9.2f} {amp:>10.4g} "
                          f"{GAUSS_FWHM * abs(sigma):>9.2f} {area:>10.4g}")
             ws.new_item(f"{key} peak {n} @ {center:.0f}",          # drawn on the baseline
-                        x, p[0] + _gauss(x, amp, center, sigma), dashed=True)
-        ws.new_item(f"{key} fit", x, total, dashed=True)
+                        x, p[0] + _gauss(x, amp, center, sigma), dashed=True,
+                        tauc=it.get("tauc", ""))
+        ws.new_item(f"{key} fit", x, total, dashed=True, tauc=it.get("tauc", ""))
         report.append("\n".join(lines))
     return "\n".join(report)
+
+
+# ---- Tauc plot (optical band gap) ------------------------------------------
+# Turns a spectrum (X = wavelength in nm, Y = absorbance) into a Tauc plot:
+#     X = photon energy  E = 1239.84 / wavelength   (eV)
+#     Y = (A * E)^2      direct allowed transition
+#     Y = (A * E)^(1/2)  indirect allowed transition
+# Absorbance stands in for the absorption coefficient; they differ only by a
+# constant factor, which doesn't move the band gap.
+# A straight line fitted over the energy range you type is extended down to
+# Y = 0; where it crosses the axis is the band gap Eg.
+HC_EV_NM = 1239.84193
+TAUC_POWER = {"direct": 2.0, "indirect": 0.5}
+
+
+def multi_tauc(ws, keys, value, kind):
+    """Make a Tauc plot of each item (drawn in a second graph below the
+    spectra). With an energy range typed, also fit the line and report Eg.
+    Applied to an existing Tauc plot item, it only does the fit."""
+    rng = _numbers(value)
+    if rng and len(rng) != 2:
+        raise ValueError("Type two energies for the fit range, e.g. 2.9, 3.2 (in eV).")
+    report = []
+    for key in keys:
+        it = ws.items[key]
+        if it.get("tauc"):
+            if it["tauc"] != kind:
+                raise ValueError(f"'{key}' is already a Tauc plot ({it['tauc']}). "
+                                 f"Use the original spectrum to make a {kind} one.")
+            if not rng:
+                raise ValueError(f"'{key}' is already a Tauc plot. Type the energy "
+                                 f"range to fit, e.g. 2.9, 3.2.")
+            name, e, t = key, it["x"], it["y"]
+        else:
+            if it["x"].min() <= 0:
+                raise ValueError(f"'{key}' has X values of 0 or below. The X column "
+                                 f"must be wavelength in nm.")
+            e = HC_EV_NM / it["x"]
+            t = np.clip(it["y"] * e, 0, None) ** TAUC_POWER[kind]
+            order = np.argsort(e)
+            e, t = e[order], t[order]
+            name = ws.new_item(f"{key} Tauc {kind}", e, t, tauc=kind)
+            ws.details.append(dict(item=key, result=f"created '{name}'"))
+        if not rng:
+            continue
+
+        lo, hi = sorted(rng)
+        sel = (e >= lo) & (e <= hi)
+        if sel.sum() < 3:
+            raise ValueError(f"Only {sel.sum()} point(s) of '{key}' are between {lo:g} "
+                             f"and {hi:g} eV. Widen the range (the data covers "
+                             f"{e.min():.3g} to {e.max():.3g} eV).")
+        slope, icpt = np.polyfit(e[sel], t[sel], 1)
+        if slope <= 0:
+            raise ValueError(f"The line fitted to '{key}' between {lo:g} and {hi:g} eV "
+                             f"doesn't rise, so it gives no band gap. Pick the straight, "
+                             f"rising part of the absorption edge.")
+        eg = -icpt / slope
+        ss_res = np.sum((t[sel] - (slope * e[sel] + icpt)) ** 2)
+        ss_tot = np.sum((t[sel] - t[sel].mean()) ** 2)
+        r2 = 1 - ss_res / ss_tot if ss_tot else float("nan")
+        line_x = np.linspace(eg, hi, 50)                  # from Y = 0 up to the range
+        ws.new_item(f"{name} fit", line_x, slope * line_x + icpt, dashed=True, tauc=kind)
+        ws.details.append(dict(item=name, result=f"Eg = {eg:.3f} eV", eg=eg, r2=r2))
+        report.append(f"{name}: Eg = {eg:.3f} eV  (fit {lo:g}-{hi:g} eV, "
+                      f"{sel.sum()} points, R^2 = {r2:.4f})")
+    return "\n".join(report) or None
 
 
 # ---- the dropdown ------------------------------------------------------------
@@ -255,6 +324,12 @@ FUNCTIONS = {
     "Average":                  dict(kind="multi", fn=multi_average, hint=None, default="", tag=""),
     "Deconvolution (Gaussian)": dict(kind="multi", fn=multi_deconvolve,
                                      hint="Peak positions, e.g. 480, 550 (blank = auto)",
+                                     default="", tag=""),
+    "Tauc plot (direct)":       dict(kind="multi", fn=lambda ws, k, v: multi_tauc(ws, k, v, "direct"),
+                                     hint="Fit range in eV, e.g. 2.9, 3.2 (blank = plot only)",
+                                     default="", tag=""),
+    "Tauc plot (indirect)":     dict(kind="multi", fn=lambda ws, k, v: multi_tauc(ws, k, v, "indirect"),
+                                     hint="Fit range in eV, e.g. 2.9, 3.2 (blank = plot only)",
                                      default="", tag=""),
     "Add offset":               dict(kind="each", fn=fn_offset, hint="Offset", default="0.1", tag="+{v}"),
     "Smooth (moving average)":  dict(kind="each", fn=fn_smooth, hint="Window (number of points)", default="5", tag="smooth {v}"),
@@ -269,7 +344,7 @@ class WorkingSet:
     """Copies of Y columns that functions are applied to."""
 
     def __init__(self):
-        self.items = {}       # name -> {"x", "y", "ops": [tags], "dashed": bool}
+        self.items = {}       # name -> {"x", "y", "ops": [tags], "dashed": bool, "tauc": str}
         self._history = []    # snapshots for Undo: (items, extra)
         self.details = []     # filled by functions with numbers for the log
 
@@ -334,11 +409,12 @@ class WorkingSet:
         self.items[name] = dict(x=x, y=y[first], ops=[], dashed=False, source=key)
         return name
 
-    def new_item(self, base_name, x, y, dashed=False):
-        """Add a result (average, fitted peak...) as a new item."""
+    def new_item(self, base_name, x, y, dashed=False, tauc=""):
+        """Add a result (average, fitted peak...) as a new item.
+        tauc = "direct"/"indirect" for Tauc plot items (X is photon energy)."""
         key = self.unique_key(base_name)
         self.items[key] = dict(x=np.asarray(x, float), y=np.asarray(y, float),
-                               ops=[], dashed=dashed)
+                               ops=[], dashed=dashed, tauc=tauc)
         return key
 
     def remove(self, keys):
@@ -617,14 +693,14 @@ class App(tk.Tk):
 
         ttk.Label(side, text="Results").pack(anchor="w")
         res_frame = ttk.Frame(side)
-        res_frame.pack(fill="both", expand=True)
-        self.results = tk.Text(res_frame, height=9, width=36, wrap="none",
+        res_frame.pack(fill="x")
+        self.results = tk.Text(res_frame, height=5, width=36, wrap="none",
                                font=("Consolas", 9))
         xscroll = ttk.Scrollbar(res_frame, orient="horizontal",
                                 command=self.results.xview)
         self.results.config(xscrollcommand=xscroll.set)
         xscroll.pack(side="bottom", fill="x")
-        self.results.pack(fill="both", expand=True)
+        self.results.pack(fill="x")
         ttk.Button(side, text="Clear results",
                    command=lambda: self.results.delete("1.0", "end")
                    ).pack(fill="x", pady=(4, 0))
@@ -653,15 +729,16 @@ class App(tk.Tk):
 
         self.fig = Figure(figsize=(8, 6), dpi=100, constrained_layout=True)
         self.ax = self.fig.add_subplot(111)
+        self.ax_tauc = None                   # second graph, shown when there are Tauc plots
         self.ax.text(0.5, 0.5, "Open a file to begin", ha="center", va="center",
                      color="#888", fontsize=14, transform=self.ax.transAxes)
         self.ax.set_axis_off()
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=area)
         # toolbar gives zoom, pan, reset and save
-        toolbar = NavigationToolbar2Tk(self.canvas, area, pack_toolbar=False)
-        toolbar.update()
-        toolbar.pack(side="bottom", fill="x")
+        self.toolbar = NavigationToolbar2Tk(self.canvas, area, pack_toolbar=False)
+        self.toolbar.update()
+        self.toolbar.pack(side="bottom", fill="x")
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
     # ---- loading ----------------------------------------------------------
@@ -783,9 +860,12 @@ class App(tk.Tk):
             return
         self.ws.checkpoint(extra=self._column_state())
         sheet_x = pd.to_numeric(self.df[self.x_box.get()], errors="coerce").to_numpy(float)
-        added, failed = [], []
+        added, failed, tauc = [], [], []
         for k in keys:
             it = self.ws.items[k]
+            if it.get("tauc"):
+                tauc.append(k)
+                continue
             if it.get("source") and not it["ops"] and not it.get("renamed"):
                 self.log_event("Move to Y columns", item=k, result="original column")
                 continue
@@ -799,7 +879,12 @@ class App(tk.Tk):
             self.df[name] = y
             added.append(name)
             self.log_event("Move to Y columns", item=k, result=f"new column '{name}'")
-        self.ws.remove([k for k in keys if k not in failed])
+        self.ws.remove([k for k in keys if k not in failed and k not in tauc])
+        if tauc:
+            messagebox.showwarning("Not moved",
+                                   "Tauc plot items have photon energy as X, so they "
+                                   "can't go onto the sheet. Use Export instead:\n"
+                                   + "\n".join(tauc))
         if failed:
             messagebox.showwarning("Not moved",
                                    "These don't overlap this sheet's X values, so they "
@@ -889,6 +974,8 @@ class App(tk.Tk):
             text = f"Will apply to all {n_all} item(s)."
         if self.func_var.get() == "Average" and n_all:
             text += "\nUses the X points of the top item."
+        if self.func_var.get().startswith("Tauc") and n_all:
+            text += "\nX must be wavelength in nm."
         self.target_label.config(text=text)
 
     def apply_function(self):
@@ -921,9 +1008,12 @@ class App(tk.Tk):
         x_col = self.x_box.get()
         series = [(c, self.df[x_col], self.df[c], "original")
                   for c in (self.y_names[i] for i in self.y_list.curselection())]
-        series += [(self.ws.label(k), it["x"], it["y"],
-                    "fit" if it.get("dashed") else "working")
-                   for k, it in self.ws.items.items()]
+        work = [(self.ws.label(k), it["x"], it["y"],
+                 "fit" if it.get("dashed") else "working", it.get("tauc"))
+                for k, it in self.ws.items.items()]
+        series += [w[:4] for w in work if not w[4]]
+        tauc = [w for w in work if w[4]]
+        self._set_panels(bool(tauc))
         self.ax.set_axis_on()
         self.ax.set_yscale("linear")
         draw_plot(self.ax, series,
@@ -933,7 +1023,28 @@ class App(tk.Tk):
                   y_label=self.ylabel_var.get().strip(),
                   xlim=(self._axis_value(self.xmin_var), self._axis_value(self.xmax_var)),
                   ylim=(self._axis_value(self.ymin_var), self._axis_value(self.ymax_var)))
+        if tauc:
+            kinds = {w[4] for w in tauc}
+            y_label = (r"$(\alpha h\nu)^2$" if kinds == {"direct"} else
+                       r"$(\alpha h\nu)^{1/2}$" if kinds == {"indirect"} else
+                       r"$(\alpha h\nu)^{1/n}$")
+            draw_plot(self.ax_tauc, [w[:4] for w in tauc],
+                      style=self.style_var.get(), grid=self.grid_var.get(),
+                      title="Tauc plot", x_label="Photon energy (eV)", y_label=y_label)
+            self.ax_tauc.axhline(0, color="#888", linewidth=0.8)
         self.canvas.draw_idle()
+
+    def _set_panels(self, tauc):
+        """One graph, or two stacked when there are Tauc plots (spectra on
+        top, Tauc plot below). The axis range boxes apply to the top graph."""
+        if tauc == (self.ax_tauc is not None):
+            return
+        self.fig.clear()
+        if tauc:
+            self.ax, self.ax_tauc = self.fig.subplots(2, 1)
+        else:
+            self.ax, self.ax_tauc = self.fig.add_subplot(111), None
+        self.toolbar.update()                 # reset zoom history for the new graphs
 
     @staticmethod
     def _axis_value(var):
