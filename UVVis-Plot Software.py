@@ -589,6 +589,7 @@ class App(tk.Tk):
         self.log = []              # rows for the function log CSV
         self.file_name = ""
         self.colors = {}           # colour groups: Y column name -> colour
+        self.group_names = {}      # colour -> group name (for the grouped legend)
 
         self._build_header()
         self._build_left_panel()
@@ -707,6 +708,10 @@ class App(tk.Tk):
                         command=self.redraw).pack(side="left", padx=(8, 0))
         ttk.Button(checks, text="Reset axes", command=self.reset_axes
                    ).pack(side="right")
+        self.group_legend_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(g, text="Group legend (one entry per group)",
+                        variable=self.group_legend_var, command=self.redraw
+                        ).grid(row=10, column=0, columnspan=4, sticky="w", pady=(0, 2))
 
         ttk.Button(side, text="Save graph as image...",
                    command=self.save_image).pack(fill="x", pady=(6, 0))
@@ -832,6 +837,7 @@ class App(tk.Tk):
         self.tables = tables
         self.ws = WorkingSet()                # new file -> empty working list
         self.colors = {}
+        self.group_names = {}
         self.refresh_working()
         self.file_name = os.path.basename(path)
         self.file_label.config(text=self.file_name)
@@ -886,9 +892,15 @@ class App(tk.Tk):
                                       parent=self)[1]
         if not color:
             return
+        default = self.group_names.get(color) or f"Group {len(self.group_names) + 1}"
+        name = simpledialog.askstring("Group name", "Name for this group (shown in the "
+                                      "legend when 'Group legend' is ticked):",
+                                      initialvalue=default, parent=self)
+        self.group_names[color] = (name or "").strip() or default
         for col in cols:
             self.colors[self.key_for(col)] = color
-        self.log_event("Colour group", item=", ".join(cols), result=color)
+        self.log_event("Colour group", item=", ".join(cols),
+                       result=f"{self.group_names[color]} ({color})")
         self.refresh_available()
         self.redraw()
 
@@ -1119,6 +1131,14 @@ class App(tk.Tk):
         x_col = self.x_box.get()
         series = [(c, self.df[x_col], self.df[c], "original", self.colors.get(self.key_for(c)))
                   for c in (self.y_names[i] for i in self.y_list.curselection())]
+        if self.group_legend_var.get():       # one legend entry per colour group
+            shown = set()
+            for i, (c, x, y, look, color) in enumerate(series):
+                if color:
+                    # labels starting with "_" are left out of the legend
+                    label = "_" + c if color in shown else self.group_names.get(color, c)
+                    series[i] = (label, x, y, look, color)
+                    shown.add(color)
         work = [(self.ws.label(k), it["x"], it["y"],
                  "fit" if it.get("dashed") else "working", it.get("tauc"))
                 for k, it in self.ws.items.items()]
