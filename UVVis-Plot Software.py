@@ -44,8 +44,8 @@ HEADER_TEXT_COLOR = "#ffffff"
 
 # Starting axis ranges of the Tauc plot graph (min, max); "" = automatic.
 # They can be changed in the Graph panel while the program runs.
-TAUC_XLIM = ("1", "1.75")     # photon energy, eV
-TAUC_YLIM = ("0", "6")
+TAUC_XLIM = ("0", "3.0")      # photon energy, eV
+TAUC_YLIM = ("0", "250")
 
 # Columns of the function log CSV
 LOG_COLUMNS = ["Time", "File", "Action", "Item", "Value", "Result",
