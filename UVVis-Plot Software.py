@@ -26,7 +26,7 @@ import copy
 import os
 import sys
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import ttk, filedialog, messagebox, simpledialog, colorchooser
 
 import numpy as np
 import pandas as pd
@@ -42,9 +42,15 @@ APP_SUBTITLE = "Spectra plotting and parameter extraction"
 HEADER_COLOR = "#1f3b57"        # background of the header band
 HEADER_TEXT_COLOR = "#ffffff"
 
+# Starting axis ranges of the Tauc plot graph (min, max); "" = automatic.
+# They can be changed in the Graph panel while the program runs.
+TAUC_XLIM = ("0", "3.0")      # photon energy, eV
+TAUC_YLIM = ("0", "250")
+
 # Columns of the function log CSV
 LOG_COLUMNS = ["Time", "File", "Action", "Item", "Value", "Result",
-               "Peak", "Center", "Height", "FWHM", "Area", "Baseline", "R2"]
+               "Peak", "Center", "Height", "FWHM", "Area", "Baseline", "Eg", "R2",
+               "Max X", "Max", "Min X", "Min"]
 
 STYLES = {
     "Line": dict(linestyle="-", marker=""),
@@ -95,10 +101,43 @@ def fn_smooth(x, y, value):
 
 
 def fn_derivative(x, y, value):
-    """dY/dX at each point."""
+    """dY/dX at each point. With an X range typed ("400, 600"), only that
+    part of the curve is kept and differentiated."""
+    rng = _numbers(value)
+    if rng:
+        if len(rng) != 2:
+            raise ValueError("Type two X values for the range, e.g. 400, 600 "
+                             "(blank = whole curve).")
+        lo, hi = sorted(rng)
+        keep = (x >= lo) & (x <= hi)
+        if keep.sum() < 2:
+            raise ValueError(f"Fewer than 2 points between {lo:g} and {hi:g} "
+                             f"(the data covers {x.min():g} to {x.max():g}).")
+        x, y = x[keep], y[keep]
     if len(x) < 2:
         raise ValueError("Need at least 2 points for a derivative.")
     return x, np.gradient(y, x)
+
+
+# ---- Global min / max (report only, the curves aren't changed) -------------
+def multi_extremes(ws, keys, value):
+    """Print the global maximum and minimum of each item and where they are.
+    With a window of N points, a smoothed copy (moving average) is searched so
+    single noisy points don't count; the item itself isn't changed."""
+    n = int(round(_num(value, "the window size"))) if value else 1
+    if n < 1:
+        raise ValueError("The window must be 1 (no smoothing) or more points.")
+    lines = []
+    for key in keys:
+        x, y = ws.items[key]["x"], ws.items[key]["y"]
+        if n > 1:
+            y = fn_smooth(x, y, str(n))[1]
+        i, j = int(np.argmax(y)), int(np.argmin(y))
+        ws.details.append(dict(item=key, result=f"smoothed over {n} points" if n > 1 else "",
+                               max_x=x[i], max=y[i], min_x=x[j], min=y[j]))
+        lines.append(f"{key}\n  max {y[i]:.4g} at X = {x[i]:.5g}"
+                     f"\n  min {y[j]:.4g} at X = {x[j]:.5g}")
+    return "\n".join(lines)
 
 
 # ---- Average (several items -> one new item) -------------------------------
@@ -108,15 +147,16 @@ def multi_average(ws, keys, value):
     if len(keys) < 2:
         raise ValueError("Needs at least 2 items to average.")
     items = [ws.items[k] for k in keys]
+    if len({it.get("tauc", "") for it in items}) > 1:
+        raise ValueError("Can't average Tauc plot items with spectra (different X units).")
     lo = max(it["x"].min() for it in items)
     hi = min(it["x"].max() for it in items)
     x = items[0]["x"][(items[0]["x"] >= lo) & (items[0]["x"] <= hi)]
     if len(x) == 0:
         raise ValueError("These items don't share any X range.")
     y = np.mean([np.interp(x, it["x"], it["y"]) for it in items], axis=0)
-    new = ws.new_item(f"Average of {len(keys)}", x, y)
+    new = ws.new_item(f"Average of {len(keys)}", x, y, tauc=items[0].get("tauc", ""))
     ws.details.append(dict(item=", ".join(keys), result=f"created '{new}'"))
-    return f"Averaged into '{new}': " + ", ".join(keys)
 
 
 # ---- Deconvolution (Gaussian peak fitting) ---------------------------------
@@ -241,10 +281,78 @@ def multi_deconvolve(ws, keys, value):
             lines.append(f"  {n:>2} {center:>9.2f} {amp:>10.4g} "
                          f"{GAUSS_FWHM * abs(sigma):>9.2f} {area:>10.4g}")
             ws.new_item(f"{key} peak {n} @ {center:.0f}",          # drawn on the baseline
-                        x, p[0] + _gauss(x, amp, center, sigma), dashed=True)
-        ws.new_item(f"{key} fit", x, total, dashed=True)
+                        x, p[0] + _gauss(x, amp, center, sigma), dashed=True,
+                        tauc=it.get("tauc", ""))
+        ws.new_item(f"{key} fit", x, total, dashed=True, tauc=it.get("tauc", ""))
         report.append("\n".join(lines))
     return "\n".join(report)
+
+
+# ---- Tauc plot (optical band gap) ------------------------------------------
+# Turns a spectrum (X = wavelength in nm, Y = absorbance) into a Tauc plot:
+#     X = photon energy  E = 1239.84 / wavelength   (eV)
+#     Y = (A * E)^2      direct allowed transition
+#     Y = (A * E)^(1/2)  indirect allowed transition
+# Absorbance stands in for the absorption coefficient; they differ only by a
+# constant factor, which doesn't move the band gap.
+# A straight line fitted over the energy range you type is extended down to
+# Y = 0; where it crosses the axis is the band gap Eg.
+HC_EV_NM = 1239.84193
+TAUC_POWER = {"direct": 2.0, "indirect": 0.5}
+
+
+def multi_tauc(ws, keys, value, kind):
+    """Make a Tauc plot of each item (drawn in a second graph below the
+    spectra). With an energy range typed, also fit the line and report Eg.
+    Applied to an existing Tauc plot item, it only does the fit."""
+    rng = _numbers(value)
+    if rng and len(rng) != 2:
+        raise ValueError("Type two energies for the fit range, e.g. 2.9, 3.2 (in eV).")
+    report = []
+    for key in keys:
+        it = ws.items[key]
+        if it.get("tauc"):
+            if it["tauc"] != kind:
+                raise ValueError(f"'{key}' is already a Tauc plot ({it['tauc']}). "
+                                 f"Use the original spectrum to make a {kind} one.")
+            if not rng:
+                raise ValueError(f"'{key}' is already a Tauc plot. Type the energy "
+                                 f"range to fit, e.g. 2.9, 3.2.")
+            name, e, t = key, it["x"], it["y"]
+        else:
+            if it["x"].min() <= 0:
+                raise ValueError(f"'{key}' has X values of 0 or below. The X column "
+                                 f"must be wavelength in nm.")
+            e = HC_EV_NM / it["x"]
+            t = np.clip(it["y"] * e, 0, None) ** TAUC_POWER[kind]
+            order = np.argsort(e)
+            e, t = e[order], t[order]
+            name = ws.new_item(f"{key} Tauc {kind}", e, t, tauc=kind)
+            ws.details.append(dict(item=key, result=f"created '{name}'"))
+        if not rng:
+            continue
+
+        lo, hi = sorted(rng)
+        sel = (e >= lo) & (e <= hi)
+        if sel.sum() < 3:
+            raise ValueError(f"Only {sel.sum()} point(s) of '{key}' are between {lo:g} "
+                             f"and {hi:g} eV. Widen the range (the data covers "
+                             f"{e.min():.3g} to {e.max():.3g} eV).")
+        slope, icpt = np.polyfit(e[sel], t[sel], 1)
+        if slope <= 0:
+            raise ValueError(f"The line fitted to '{key}' between {lo:g} and {hi:g} eV "
+                             f"doesn't rise, so it gives no band gap. Pick the straight, "
+                             f"rising part of the absorption edge.")
+        eg = -icpt / slope
+        ss_res = np.sum((t[sel] - (slope * e[sel] + icpt)) ** 2)
+        ss_tot = np.sum((t[sel] - t[sel].mean()) ** 2)
+        r2 = 1 - ss_res / ss_tot if ss_tot else float("nan")
+        line_x = np.linspace(eg, hi, 50)                  # from Y = 0 up to the range
+        ws.new_item(f"{name} fit", line_x, slope * line_x + icpt, dashed=True, tauc=kind)
+        ws.details.append(dict(item=name, result=f"Eg = {eg:.3f} eV", eg=eg, r2=r2))
+        report.append(f"{name}: Eg = {eg:.3f} eV  (fit {lo:g}-{hi:g} eV, "
+                      f"{sel.sum()} points, R^2 = {r2:.4f})")
+    return "\n".join(report) or None
 
 
 # ---- the dropdown ------------------------------------------------------------
@@ -256,9 +364,20 @@ FUNCTIONS = {
     "Deconvolution (Gaussian)": dict(kind="multi", fn=multi_deconvolve,
                                      hint="Peak positions, e.g. 480, 550 (blank = auto)",
                                      default="", tag=""),
+    "Tauc plot (direct)":       dict(kind="multi", fn=lambda ws, k, v: multi_tauc(ws, k, v, "direct"),
+                                     hint="Fit range in eV, e.g. 2.9, 3.2 (blank = plot only)",
+                                     default="", tag=""),
+    "Tauc plot (indirect)":     dict(kind="multi", fn=lambda ws, k, v: multi_tauc(ws, k, v, "indirect"),
+                                     hint="Fit range in eV, e.g. 2.9, 3.2 (blank = plot only)",
+                                     default="", tag=""),
     "Add offset":               dict(kind="each", fn=fn_offset, hint="Offset", default="0.1", tag="+{v}"),
     "Smooth (moving average)":  dict(kind="each", fn=fn_smooth, hint="Window (number of points)", default="5", tag="smooth {v}"),
-    "1st derivative":           dict(kind="each", fn=fn_derivative, hint=None, default="", tag="d/dx"),
+    "1st derivative":           dict(kind="each", fn=fn_derivative,
+                                     hint="X range, e.g. 400, 600 (blank = whole curve)",
+                                     default="", tag="d/dx {v}"),
+    "Global min / max":         dict(kind="multi", fn=multi_extremes,
+                                     hint="Smoothing window, points (1 = none)",
+                                     default="5", tag=""),
 }
 
 
@@ -269,7 +388,7 @@ class WorkingSet:
     """Copies of Y columns that functions are applied to."""
 
     def __init__(self):
-        self.items = {}       # name -> {"x", "y", "ops": [tags], "dashed": bool}
+        self.items = {}       # name -> {"x", "y", "ops": [tags], "dashed": bool, "tauc": str}
         self._history = []    # snapshots for Undo: (items, extra)
         self.details = []     # filled by functions with numbers for the log
 
@@ -334,11 +453,12 @@ class WorkingSet:
         self.items[name] = dict(x=x, y=y[first], ops=[], dashed=False, source=key)
         return name
 
-    def new_item(self, base_name, x, y, dashed=False):
-        """Add a result (average, fitted peak...) as a new item."""
+    def new_item(self, base_name, x, y, dashed=False, tauc=""):
+        """Add a result (average, fitted peak...) as a new item.
+        tauc = "direct"/"indirect" for Tauc plot items (X is photon energy)."""
         key = self.unique_key(base_name)
         self.items[key] = dict(x=np.asarray(x, float), y=np.asarray(y, float),
-                               ops=[], dashed=dashed)
+                               ops=[], dashed=dashed, tauc=tauc)
         return key
 
     def remove(self, keys):
@@ -362,7 +482,7 @@ class WorkingSet:
                 # compute everything first so one failure leaves nothing half-done
                 results = {k: spec["fn"](self.items[k]["x"], self.items[k]["y"], value)
                            for k in keys}
-                tag = spec["tag"].format(v=value)
+                tag = spec["tag"].format(v=value).strip()
                 for k, (x, y) in results.items():
                     self.items[k]["x"] = np.asarray(x, float)
                     self.items[k]["y"] = np.asarray(y, float)
@@ -411,21 +531,23 @@ def load_tables(path):
 
 def draw_plot(ax, series, style="Line", log_y=False, grid=True,
               title="", x_label="", y_label="", xlim=(None, None), ylim=(None, None)):
-    """series = list of (label, x, y, look), look = "original", "working" or "fit".
+    """series = list of (label, x, y, look) or (label, x, y, look, color),
+    look = "original", "working" or "fit"; color None = automatic.
     xlim / ylim = (min, max); None = automatic. min > max flips the axis.
     Returns number of lines drawn."""
     ax.clear()
     drawn = 0
-    for label, x, y, look in series:
+    for label, x, y, look, *color in series:
+        color = color[0] if color else None
         x = pd.to_numeric(pd.Series(list(x)), errors="coerce")
         y = pd.to_numeric(pd.Series(list(y)), errors="coerce")
         ok = x.notna() & y.notna()          # skip blanks and text cells
         if ok.sum() == 0:
             continue
         if look == "fit":                    # deconvolution peaks / total fit
-            ax.plot(x[ok], y[ok], label=label, linewidth=1.2, linestyle="--")
+            ax.plot(x[ok], y[ok], label=label, linewidth=1.2, linestyle="--", color=color)
         else:
-            ax.plot(x[ok], y[ok], label=label,
+            ax.plot(x[ok], y[ok], label=label, color=color,
                     linewidth=2.0 if look == "working" else 1.2, **STYLES[style])
         drawn += 1
 
@@ -454,15 +576,21 @@ class App(tk.Tk):
     def __init__(self, start_file=None):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1450x880")
-        self.minsize(1100, 650)
+        # 1450 x 880, or smaller so the whole window fits on the screen
+        w = min(1450, self.winfo_screenwidth() - 40)
+        h = min(880, self.winfo_screenheight() - 100)
+        self.geometry(f"{w}x{h}+10+10")
+        self.minsize(min(1100, w), min(650, h))
 
         self.tables = {}
+        self.settings_win = None   # the "Graph settings" window, when open
         self.df = None
         self.y_names = []          # columns shown in the "available" list
         self.ws = WorkingSet()
         self.log = []              # rows for the function log CSV
         self.file_name = ""
+        self.colors = {}           # colour groups: Y column name -> colour
+        self.group_names = {}      # colour -> group name (for the grouped legend)
 
         self._build_header()
         self._build_left_panel()
@@ -491,82 +619,69 @@ class App(tk.Tk):
                    command=self.choose_file).pack(fill="x")
         self.file_label = ttk.Label(side, text="No file loaded", wraplength=230,
                                     foreground="#666")
-        self.file_label.pack(fill="x", pady=(4, 8))
+        self.file_label.pack(fill="x", pady=(2, 4))
 
-        ttk.Label(side, text="Sheet").pack(anchor="w")
-        self.sheet_box = ttk.Combobox(side, state="readonly", width=30)
-        self.sheet_box.pack(fill="x", pady=(0, 6))
+        pick = ttk.Frame(side)                # sheet and X column, label beside the box
+        pick.pack(fill="x", pady=(0, 4))
+        pick.columnconfigure(1, weight=1)
+        ttk.Label(pick, text="Sheet").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.sheet_box = ttk.Combobox(pick, state="readonly", width=22)
+        self.sheet_box.grid(row=0, column=1, sticky="ew", pady=1)
         self.sheet_box.bind("<<ComboboxSelected>>", lambda e: self.on_sheet_change())
-
-        ttk.Label(side, text="X column (wavelength)").pack(anchor="w")
-        self.x_box = ttk.Combobox(side, state="readonly", width=30)
-        self.x_box.pack(fill="x", pady=(0, 6))
+        ttk.Label(pick, text="X (nm)").grid(row=1, column=0, sticky="w", padx=(0, 6))
+        self.x_box = ttk.Combobox(pick, state="readonly", width=22)
+        self.x_box.grid(row=1, column=1, sticky="ew", pady=1)
         self.x_box.bind("<<ComboboxSelected>>", lambda e: self.on_x_change())
 
         ttk.Label(side, text="Y columns (click to show on graph)").pack(anchor="w")
+        lower = ttk.Frame(side)               # packed first so the list shrinks, not this
+        lower.pack(side="bottom", fill="x")
         self.y_list = self._listbox(side, "multiple")
+        self.y_list.config(selectbackground="#cfe0f5", selectforeground="black")
         self.y_list.bind("<<ListboxSelect>>", lambda e: self.redraw())
+        side = lower
 
         row = ttk.Frame(side)
         row.pack(fill="x", pady=(4, 2))
-        ttk.Button(row, text="All", command=lambda: self.select_y(True)
+        ttk.Button(row, text="All", command=lambda: self.select_y(True), width=1
                    ).pack(side="left", expand=True, fill="x")
-        ttk.Button(row, text="None", command=lambda: self.select_y(False)
+        ttk.Button(row, text="None", command=lambda: self.select_y(False), width=1
                    ).pack(side="left", expand=True, fill="x")
         ttk.Button(side, text="Move selected to working list  →",
-                   command=self.move_to_working).pack(fill="x", pady=(2, 8))
+                   command=self.move_to_working).pack(fill="x", pady=(2, 4))
+
+        # graph settings: the values live here; their boxes are in the
+        # "Graph settings" window (open_settings_window)
+        self.title_var, self.xlabel_var, self.ylabel_var = (tk.StringVar() for _ in range(3))
+        # axis ranges: min "to" max, blank = automatic
+        self.xmin_var, self.xmax_var, self.ymin_var, self.ymax_var = (
+            tk.StringVar() for _ in range(4))
+        self.tauc_xmin_var, self.tauc_xmax_var = (tk.StringVar(value=v) for v in TAUC_XLIM)
+        self.tauc_ymin_var, self.tauc_ymax_var = (tk.StringVar(value=v) for v in TAUC_YLIM)
+        self.group_legend_var = tk.BooleanVar(value=False)
 
         g = ttk.LabelFrame(side, text="Graph", padding=(8, 4))
         g.pack(fill="x", pady=(4, 0))
         g.columnconfigure(1, weight=1)
-        g.columnconfigure(3, weight=1)
 
-        def entry(var, row, col, span=1):
-            e = ttk.Entry(g, textvariable=var, width=7)
-            e.grid(row=row, column=col, columnspan=span, sticky="ew", pady=2)
-            e.bind("<Return>", lambda ev: self.redraw())
-            e.bind("<FocusOut>", lambda ev: self.redraw())
-
-        def label(text, row):
-            ttk.Label(g, text=text).grid(row=row, column=0, sticky="w", padx=(0, 6))
-
-        self.title_var, self.xlabel_var, self.ylabel_var = (tk.StringVar() for _ in range(3))
-        for row, (text, var) in enumerate((("Title", self.title_var),
-                                           ("X label", self.xlabel_var),
-                                           ("Y label", self.ylabel_var))):
-            label(text, row)
-            entry(var, row, 1, span=3)
-
-        # axis ranges: min "to" max, blank = automatic
-        self.xmin_var, self.xmax_var, self.ymin_var, self.ymax_var = (
-            tk.StringVar() for _ in range(4))
-        for row, text, lo, hi in ((3, "X range", self.xmin_var, self.xmax_var),
-                                  (4, "Y range", self.ymin_var, self.ymax_var)):
-            label(text, row)
-            entry(lo, row, 1)
-            ttk.Label(g, text="to").grid(row=row, column=2, padx=4)
-            entry(hi, row, 3)
-        ttk.Label(g, text="Blank = automatic. Put the larger X first to flip it.",
-                  foreground="#666", font=("TkDefaultFont", 8)
-                  ).grid(row=5, column=0, columnspan=4, sticky="w")
-
-        label("Style", 6)
+        ttk.Label(g, text="Style").grid(row=0, column=0, sticky="w", padx=(0, 6))
         self.style_var = tk.StringVar(value="Line")
         style_box = ttk.Combobox(g, state="readonly", values=list(STYLES),
                                  textvariable=self.style_var, width=7)
-        style_box.grid(row=6, column=1, columnspan=3, sticky="ew", pady=2)
+        style_box.grid(row=0, column=1, sticky="ew", pady=2)
         style_box.bind("<<ComboboxSelected>>", lambda e: self.redraw())
 
         self.log_var = tk.BooleanVar(value=False)
         self.grid_var = tk.BooleanVar(value=True)
         checks = ttk.Frame(g)
-        checks.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(2, 2))
+        checks.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 2))
         ttk.Checkbutton(checks, text="Log Y", variable=self.log_var,
                         command=self.redraw).pack(side="left")
         ttk.Checkbutton(checks, text="Grid", variable=self.grid_var,
                         command=self.redraw).pack(side="left", padx=(8, 0))
-        ttk.Button(checks, text="Reset axes", command=self.reset_axes
-                   ).pack(side="right")
+        ttk.Button(g, text="Graph settings...",
+                   command=self.open_settings_window
+                   ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(2, 2))
 
         ttk.Button(side, text="Save graph as image...",
                    command=self.save_image).pack(fill="x", pady=(6, 0))
@@ -580,9 +695,12 @@ class App(tk.Tk):
         ttk.Label(side, text="Functions apply to the selected items,\n"
                              "or to all items if none are selected.",
                   foreground="#666").pack(anchor="w", pady=(0, 4))
+        lower = ttk.Frame(side)               # packed first so the list shrinks, not this
+        lower.pack(side="bottom", fill="x")
         self.w_list = self._listbox(side, "extended", width=36)
         self.w_list.bind("<<ListboxSelect>>", lambda e: self._update_target_label())
         self.w_list.bind("<Double-Button-1>", lambda e: self.rename_item())
+        side = lower
 
         row = ttk.Frame(side)
         row.pack(fill="x", pady=(4, 8))
@@ -617,14 +735,14 @@ class App(tk.Tk):
 
         ttk.Label(side, text="Results").pack(anchor="w")
         res_frame = ttk.Frame(side)
-        res_frame.pack(fill="both", expand=True)
-        self.results = tk.Text(res_frame, height=9, width=36, wrap="none",
+        res_frame.pack(fill="x")
+        self.results = tk.Text(res_frame, height=5, width=36, wrap="none",
                                font=("Consolas", 9))
         xscroll = ttk.Scrollbar(res_frame, orient="horizontal",
                                 command=self.results.xview)
         self.results.config(xscrollcommand=xscroll.set)
         xscroll.pack(side="bottom", fill="x")
-        self.results.pack(fill="both", expand=True)
+        self.results.pack(fill="x")
         ttk.Button(side, text="Clear results",
                    command=lambda: self.results.delete("1.0", "end")
                    ).pack(fill="x", pady=(4, 0))
@@ -653,15 +771,16 @@ class App(tk.Tk):
 
         self.fig = Figure(figsize=(8, 6), dpi=100, constrained_layout=True)
         self.ax = self.fig.add_subplot(111)
+        self.ax_tauc = None                   # second graph, shown when there are Tauc plots
         self.ax.text(0.5, 0.5, "Open a file to begin", ha="center", va="center",
                      color="#888", fontsize=14, transform=self.ax.transAxes)
         self.ax.set_axis_off()
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=area)
         # toolbar gives zoom, pan, reset and save
-        toolbar = NavigationToolbar2Tk(self.canvas, area, pack_toolbar=False)
-        toolbar.update()
-        toolbar.pack(side="bottom", fill="x")
+        self.toolbar = NavigationToolbar2Tk(self.canvas, area, pack_toolbar=False)
+        self.toolbar.update()
+        self.toolbar.pack(side="bottom", fill="x")
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
     # ---- loading ----------------------------------------------------------
@@ -687,6 +806,8 @@ class App(tk.Tk):
 
         self.tables = tables
         self.ws = WorkingSet()                # new file -> empty working list
+        self.colors = {}
+        self.group_names = {}
         self.refresh_working()
         self.file_name = os.path.basename(path)
         self.file_label.config(text=self.file_name)
@@ -724,8 +845,56 @@ class App(tk.Tk):
         self.y_list.delete(0, "end")
         for i, name in enumerate(self.y_names):
             self.y_list.insert("end", name)
+            color = self.colors.get(self.key_for(name))
+            if color:
+                self.y_list.itemconfig(i, foreground=color, selectforeground=color)
             if select_all or name in keep:
                 self.y_list.select_set(i)
+
+    def color_group(self):
+        """Give the selected Y columns one colour on the graph."""
+        cols = [self.y_names[i] for i in self.y_list.curselection()]
+        parent = (self.settings_win if self.settings_win is not None
+                  and self.settings_win.winfo_exists() else self)
+        if not cols:
+            messagebox.showinfo("Colour group", "Select the Y columns to group first.",
+                                parent=parent)
+            return
+        color = colorchooser.askcolor(title=f"Colour for {len(cols)} column(s)",
+                                      initialcolor=self.colors.get(self.key_for(cols[0])),
+                                      parent=parent)[1]
+        if not color:
+            return
+        default = self.group_names.get(color) or f"Group {len(self.group_names) + 1}"
+        name = simpledialog.askstring("Group name", "Name for this group (shown in the "
+                                      "legend when 'Group legend' is ticked):",
+                                      initialvalue=default, parent=parent)
+        self.group_names[color] = (name or "").strip() or default
+        for col in cols:
+            self.colors[self.key_for(col)] = color
+        self.log_event("Colour group", item=", ".join(cols),
+                       result=f"{self.group_names[color]} ({color})")
+        self.refresh_available()
+        self.redraw()
+
+    def _free_colors(self):
+        """Default line colours, minus those close to a colour group's, so an
+        ungrouped line doesn't look like part of a group."""
+        from matplotlib import rcParams
+        from matplotlib.colors import to_rgb
+        used = [to_rgb(c) for c in set(self.colors.values())]
+        cycle = rcParams["axes.prop_cycle"].by_key()["color"]
+        free = [c for c in cycle
+                if all(np.abs(np.subtract(to_rgb(c), u)).sum() > 0.45 for u in used)]
+        return free or cycle
+
+    def ungroup(self):
+        """Selected Y columns go back to automatic colours."""
+        cols = [self.y_names[i] for i in self.y_list.curselection()]
+        for col in cols:
+            self.colors.pop(self.key_for(col), None)
+        self.refresh_available()
+        self.redraw()
 
     def refresh_working(self):
         keep = set(self.selected_work_keys())
@@ -783,9 +952,12 @@ class App(tk.Tk):
             return
         self.ws.checkpoint(extra=self._column_state())
         sheet_x = pd.to_numeric(self.df[self.x_box.get()], errors="coerce").to_numpy(float)
-        added, failed = [], []
+        added, failed, tauc = [], [], []
         for k in keys:
             it = self.ws.items[k]
+            if it.get("tauc"):
+                tauc.append(k)
+                continue
             if it.get("source") and not it["ops"] and not it.get("renamed"):
                 self.log_event("Move to Y columns", item=k, result="original column")
                 continue
@@ -799,7 +971,12 @@ class App(tk.Tk):
             self.df[name] = y
             added.append(name)
             self.log_event("Move to Y columns", item=k, result=f"new column '{name}'")
-        self.ws.remove([k for k in keys if k not in failed])
+        self.ws.remove([k for k in keys if k not in failed and k not in tauc])
+        if tauc:
+            messagebox.showwarning("Not moved",
+                                   "Tauc plot items have photon energy as X, so they "
+                                   "can't go onto the sheet. Use Export instead:\n"
+                                   + "\n".join(tauc))
         if failed:
             messagebox.showwarning("Not moved",
                                    "These don't overlap this sheet's X values, so they "
@@ -889,6 +1066,8 @@ class App(tk.Tk):
             text = f"Will apply to all {n_all} item(s)."
         if self.func_var.get() == "Average" and n_all:
             text += "\nUses the X points of the top item."
+        if self.func_var.get().startswith("Tauc") and n_all:
+            text += "\nX must be wavelength in nm."
         self.target_label.config(text=text)
 
     def apply_function(self):
@@ -909,8 +1088,12 @@ class App(tk.Tk):
                                result=self.ws.label(k) if k in self.ws.items else "")
         if report:
             header = name + (f" ({value})" if value else "")
-            self.results.insert("end", f"{header}\n{report}\n\n")
+            if self.results.get("1.0", "end-1c"):
+                self.results.insert("end", "\n\n")
+            start = self.results.index("end-1c")
+            self.results.insert("end", f"{header}\n{report}")
             self.results.see("end")
+            self.results.see(start)               # newest result, from its first line
         self.refresh_working()
         self.redraw()
 
@@ -919,11 +1102,24 @@ class App(tk.Tk):
         if self.df is None:
             return
         x_col = self.x_box.get()
-        series = [(c, self.df[x_col], self.df[c], "original")
+        series = [(c, self.df[x_col], self.df[c], "original", self.colors.get(self.key_for(c)))
                   for c in (self.y_names[i] for i in self.y_list.curselection())]
-        series += [(self.ws.label(k), it["x"], it["y"],
-                    "fit" if it.get("dashed") else "working")
-                   for k, it in self.ws.items.items()]
+        if self.group_legend_var.get():       # one legend entry per colour group
+            shown = set()
+            for i, (c, x, y, look, color) in enumerate(series):
+                if color:
+                    # labels starting with "_" are left out of the legend
+                    label = "_" + c if color in shown else self.group_names.get(color, c)
+                    series[i] = (label, x, y, look, color)
+                    shown.add(color)
+        work = [(self.ws.label(k), it["x"], it["y"],
+                 "fit" if it.get("dashed") else "working", it.get("tauc"))
+                for k, it in self.ws.items.items()]
+        series += [w[:4] for w in work if not w[4]]
+        tauc = [w for w in work if w[4]]
+        free = iter(self._free_colors() * 50)
+        series = [(*s[:4], s[4] if len(s) > 4 and s[4] else next(free)) for s in series]
+        self._set_panels(bool(tauc))
         self.ax.set_axis_on()
         self.ax.set_yscale("linear")
         draw_plot(self.ax, series,
@@ -933,7 +1129,32 @@ class App(tk.Tk):
                   y_label=self.ylabel_var.get().strip(),
                   xlim=(self._axis_value(self.xmin_var), self._axis_value(self.xmax_var)),
                   ylim=(self._axis_value(self.ymin_var), self._axis_value(self.ymax_var)))
+        if tauc:
+            kinds = {w[4] for w in tauc}
+            y_label = (r"$(\alpha h\nu)^2$" if kinds == {"direct"} else
+                       r"$(\alpha h\nu)^{1/2}$" if kinds == {"indirect"} else
+                       r"$(\alpha h\nu)^{1/n}$")
+            draw_plot(self.ax_tauc, [w[:4] for w in tauc],
+                      style=self.style_var.get(), grid=self.grid_var.get(),
+                      title="Tauc plot", x_label="Photon energy (eV)", y_label=y_label,
+                      xlim=(self._axis_value(self.tauc_xmin_var),
+                            self._axis_value(self.tauc_xmax_var)),
+                      ylim=(self._axis_value(self.tauc_ymin_var),
+                            self._axis_value(self.tauc_ymax_var)))
+            self.ax_tauc.axhline(0, color="#888", linewidth=0.8)
         self.canvas.draw_idle()
+
+    def _set_panels(self, tauc):
+        """One graph, or two stacked when there are Tauc plots (spectra on
+        top, Tauc plot below). The axis range boxes apply to the top graph."""
+        if tauc == (self.ax_tauc is not None):
+            return
+        self.fig.clear()
+        if tauc:
+            self.ax, self.ax_tauc = self.fig.subplots(2, 1)
+        else:
+            self.ax, self.ax_tauc = self.fig.add_subplot(111), None
+        self.toolbar.update()                 # reset zoom history for the new graphs
 
     @staticmethod
     def _axis_value(var):
@@ -943,8 +1164,84 @@ class App(tk.Tk):
         except ValueError:
             return None
 
+    def open_settings_window(self):
+        """Titles, axis ranges and colour groups in their own window. The boxes
+        share their values with the graph, so changes show straight away."""
+        if self.settings_win is not None and self.settings_win.winfo_exists():
+            self.settings_win.deiconify()         # already open: bring it forward
+            self.settings_win.lift()
+            self.settings_win.focus_set()
+            return
+        win = self.settings_win = tk.Toplevel(self)
+        win.title("Graph settings")
+        win.transient(self)                       # stays above the main window
+        win.resizable(False, False)
+        body = ttk.Frame(win, padding=10)
+        body.pack(fill="both", expand=True)
+
+        def section(text):
+            f = ttk.LabelFrame(body, text=text, padding=(8, 4))
+            f.pack(fill="x", pady=(0, 8))
+            f.columnconfigure(1, weight=1)
+            f.columnconfigure(3, weight=1)
+            return f
+
+        def label(f, text, row):
+            ttk.Label(f, text=text).grid(row=row, column=0, sticky="w", padx=(0, 6))
+
+        def entry(f, var, row, col, span=1):
+            e = ttk.Entry(f, textvariable=var, width=10)
+            e.grid(row=row, column=col, columnspan=span, sticky="ew", pady=1)
+            e.bind("<Return>", lambda ev: self.redraw())
+            e.bind("<FocusOut>", lambda ev: self.redraw())
+
+        t = section("Titles")
+        for row, (text, var) in enumerate((("Title", self.title_var),
+                                           ("X label", self.xlabel_var),
+                                           ("Y label", self.ylabel_var))):
+            label(t, text, row)
+            entry(t, var, row, 1, span=3)
+
+        r = section("Axis ranges")
+        for row, (text, lo, hi) in enumerate((("X range", self.xmin_var, self.xmax_var),
+                                              ("Y range", self.ymin_var, self.ymax_var),
+                                              ("Tauc X", self.tauc_xmin_var, self.tauc_xmax_var),
+                                              ("Tauc Y", self.tauc_ymin_var, self.tauc_ymax_var))):
+            label(r, text, row)
+            entry(r, lo, row, 1)
+            ttk.Label(r, text="to").grid(row=row, column=2, padx=4)
+            entry(r, hi, row, 3)
+        ttk.Label(r, text="Blank = automatic. Put the larger X first to flip it.",
+                  foreground="#666", font=("TkDefaultFont", 8)
+                  ).grid(row=4, column=0, columnspan=4, sticky="w")
+        ttk.Button(r, text="Reset axes", command=self.reset_axes
+                   ).grid(row=5, column=0, columnspan=4, sticky="e", pady=(4, 2))
+
+        c = section("Colours")
+        ttk.Label(c, text="Applies to the Y columns selected in the main window.",
+                  foreground="#666").grid(row=0, column=0, columnspan=4, sticky="w")
+        buttons = ttk.Frame(c)
+        buttons.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(4, 2))
+        ttk.Button(buttons, text="Colour group...", command=self.color_group
+                   ).pack(side="left", expand=True, fill="x")
+        ttk.Button(buttons, text="Ungroup", command=self.ungroup
+                   ).pack(side="left", expand=True, fill="x")
+        ttk.Checkbutton(c, text="Group legend (one entry per group)",
+                        variable=self.group_legend_var, command=self.redraw
+                        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(2, 2))
+
+        def close():
+            self.redraw()                         # applies a value typed without Enter
+            win.destroy()
+        ttk.Button(body, text="Close", command=close).pack(anchor="e")
+        win.protocol("WM_DELETE_WINDOW", close)
+        # open over the graph, not on top of the Y columns list
+        win.geometry(f"+{self.winfo_rootx() + 320}+{self.winfo_rooty() + 60}")
+
     def reset_axes(self):
-        for var in (self.xmin_var, self.xmax_var, self.ymin_var, self.ymax_var):
+        for var in (self.xmin_var, self.xmax_var, self.ymin_var, self.ymax_var,
+                    self.tauc_xmin_var, self.tauc_xmax_var,
+                    self.tauc_ymin_var, self.tauc_ymax_var):
             var.set("")
         self.redraw()
 
@@ -984,7 +1281,7 @@ class App(tk.Tk):
         row = dict.fromkeys(LOG_COLUMNS, "")
         row.update(Time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                    File=self.file_name, Action=action)
-        names = {"fwhm": "FWHM", "r2": "R2"}
+        names = {"fwhm": "FWHM", "r2": "R2", "max_x": "Max X", "min_x": "Min X"}
         for key, val in fields.items():
             col = names.get(key, key.capitalize())
             if isinstance(val, (float, np.floating)):
