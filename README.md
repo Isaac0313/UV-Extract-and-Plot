@@ -1,4 +1,18 @@
 # UV-Extract-and-Plot
-This is a python tool that can map UV-Vis data, absorbance vs wavelength. The goal is to allow more onsite analysis of data and not having to plot all of them individually on Excel. 
+## About me / Goal
+- I have run a lot of UV-vis and photoluminescence spectroscopy within my undergraduate and graduate time. The most frustrating part for me is making each one of the plots, grouping them, making averages etc. 
+## Dependencies Installed
+- copy
+- os
+- sys
+- tkinter imported -> ttk, filedialog, messagebox, simpledialog, colorchooser
+- ctypes imported -> windll
+- numpy
+- pandas
+- matplotlib.figure imported -> Figure
+- matplotlib.backends.backend_tkagg imported -> FigureCanvasTkAgg, NavigationToolbar2T
 
-This is still a work in progress, will not have a fill README till then.
+## Set-Up Guide
+
+## Main Use
+- Averaging groups of data set to determine overall prefomance of a type of material.
