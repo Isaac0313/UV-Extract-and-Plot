@@ -27,6 +27,7 @@ import os
 import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog, colorchooser
+from ctypes import windll
 
 import numpy as np
 import pandas as pd
@@ -574,6 +575,7 @@ def draw_plot(ax, series, style="Line", log_y=False, grid=True,
 # ============================================================================
 class App(tk.Tk):
     def __init__(self, start_file=None):
+        windll.shcore.SetProcessDpiAwareness(1)
         super().__init__()
         self.title(APP_TITLE)
         # 1450 x 880, or smaller so the whole window fits on the screen
