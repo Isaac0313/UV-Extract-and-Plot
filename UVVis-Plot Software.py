@@ -583,6 +583,7 @@ class App(tk.Tk):
         self.minsize(min(1100, w), min(650, h))
 
         self.tables = {}
+        self.settings_win = None   # the "Graph settings" window, when open
         self.df = None
         self.y_names = []          # columns shown in the "available" list
         self.ws = WorkingSet()
@@ -646,72 +647,41 @@ class App(tk.Tk):
                    ).pack(side="left", expand=True, fill="x")
         ttk.Button(row, text="None", command=lambda: self.select_y(False), width=1
                    ).pack(side="left", expand=True, fill="x")
-        ttk.Button(row, text="Colour...", command=self.color_group, width=1
-                   ).pack(side="left", expand=True, fill="x")
-        ttk.Button(row, text="Ungroup", command=self.ungroup, width=1
-                   ).pack(side="left", expand=True, fill="x")
         ttk.Button(side, text="Move selected to working list  →",
                    command=self.move_to_working).pack(fill="x", pady=(2, 4))
 
-        g = ttk.LabelFrame(side, text="Graph", padding=(8, 4))
-        g.pack(fill="x", pady=(4, 0))
-        g.columnconfigure(1, weight=1)
-        g.columnconfigure(3, weight=1)
-
-        def entry(var, row, col, span=1):
-            e = ttk.Entry(g, textvariable=var, width=7)
-            e.grid(row=row, column=col, columnspan=span, sticky="ew", pady=1)
-            e.bind("<Return>", lambda ev: self.redraw())
-            e.bind("<FocusOut>", lambda ev: self.redraw())
-
-        def label(text, row):
-            ttk.Label(g, text=text).grid(row=row, column=0, sticky="w", padx=(0, 6))
-
+        # graph settings: the values live here; their boxes are in the
+        # "Graph settings" window (open_settings_window)
         self.title_var, self.xlabel_var, self.ylabel_var = (tk.StringVar() for _ in range(3))
-        for row, (text, var) in enumerate((("Title", self.title_var),
-                                           ("X label", self.xlabel_var),
-                                           ("Y label", self.ylabel_var))):
-            label(text, row)
-            entry(var, row, 1, span=3)
-
         # axis ranges: min "to" max, blank = automatic
         self.xmin_var, self.xmax_var, self.ymin_var, self.ymax_var = (
             tk.StringVar() for _ in range(4))
         self.tauc_xmin_var, self.tauc_xmax_var = (tk.StringVar(value=v) for v in TAUC_XLIM)
         self.tauc_ymin_var, self.tauc_ymax_var = (tk.StringVar(value=v) for v in TAUC_YLIM)
-        for row, text, lo, hi in ((3, "X range", self.xmin_var, self.xmax_var),
-                                  (4, "Y range", self.ymin_var, self.ymax_var),
-                                  (5, "Tauc X", self.tauc_xmin_var, self.tauc_xmax_var),
-                                  (6, "Tauc Y", self.tauc_ymin_var, self.tauc_ymax_var)):
-            label(text, row)
-            entry(lo, row, 1)
-            ttk.Label(g, text="to").grid(row=row, column=2, padx=4)
-            entry(hi, row, 3)
-        ttk.Label(g, text="Blank = automatic. Put the larger X first to flip it.",
-                  foreground="#666", font=("TkDefaultFont", 8)
-                  ).grid(row=7, column=0, columnspan=4, sticky="w")
+        self.group_legend_var = tk.BooleanVar(value=False)
 
-        label("Style", 8)
+        g = ttk.LabelFrame(side, text="Graph", padding=(8, 4))
+        g.pack(fill="x", pady=(4, 0))
+        g.columnconfigure(1, weight=1)
+
+        ttk.Label(g, text="Style").grid(row=0, column=0, sticky="w", padx=(0, 6))
         self.style_var = tk.StringVar(value="Line")
         style_box = ttk.Combobox(g, state="readonly", values=list(STYLES),
                                  textvariable=self.style_var, width=7)
-        style_box.grid(row=8, column=1, columnspan=3, sticky="ew", pady=2)
+        style_box.grid(row=0, column=1, sticky="ew", pady=2)
         style_box.bind("<<ComboboxSelected>>", lambda e: self.redraw())
 
         self.log_var = tk.BooleanVar(value=False)
         self.grid_var = tk.BooleanVar(value=True)
         checks = ttk.Frame(g)
-        checks.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(2, 2))
+        checks.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 2))
         ttk.Checkbutton(checks, text="Log Y", variable=self.log_var,
                         command=self.redraw).pack(side="left")
         ttk.Checkbutton(checks, text="Grid", variable=self.grid_var,
                         command=self.redraw).pack(side="left", padx=(8, 0))
-        ttk.Button(checks, text="Reset axes", command=self.reset_axes
-                   ).pack(side="right")
-        self.group_legend_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(g, text="Group legend (one entry per group)",
-                        variable=self.group_legend_var, command=self.redraw
-                        ).grid(row=10, column=0, columnspan=4, sticky="w", pady=(0, 2))
+        ttk.Button(g, text="Graph settings...",
+                   command=self.open_settings_window
+                   ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(2, 2))
 
         ttk.Button(side, text="Save graph as image...",
                    command=self.save_image).pack(fill="x", pady=(6, 0))
@@ -884,18 +854,21 @@ class App(tk.Tk):
     def color_group(self):
         """Give the selected Y columns one colour on the graph."""
         cols = [self.y_names[i] for i in self.y_list.curselection()]
+        parent = (self.settings_win if self.settings_win is not None
+                  and self.settings_win.winfo_exists() else self)
         if not cols:
-            messagebox.showinfo("Colour group", "Select the Y columns to group first.")
+            messagebox.showinfo("Colour group", "Select the Y columns to group first.",
+                                parent=parent)
             return
         color = colorchooser.askcolor(title=f"Colour for {len(cols)} column(s)",
                                       initialcolor=self.colors.get(self.key_for(cols[0])),
-                                      parent=self)[1]
+                                      parent=parent)[1]
         if not color:
             return
         default = self.group_names.get(color) or f"Group {len(self.group_names) + 1}"
         name = simpledialog.askstring("Group name", "Name for this group (shown in the "
                                       "legend when 'Group legend' is ticked):",
-                                      initialvalue=default, parent=self)
+                                      initialvalue=default, parent=parent)
         self.group_names[color] = (name or "").strip() or default
         for col in cols:
             self.colors[self.key_for(col)] = color
@@ -1190,6 +1163,80 @@ class App(tk.Tk):
             return float(var.get().strip())
         except ValueError:
             return None
+
+    def open_settings_window(self):
+        """Titles, axis ranges and colour groups in their own window. The boxes
+        share their values with the graph, so changes show straight away."""
+        if self.settings_win is not None and self.settings_win.winfo_exists():
+            self.settings_win.deiconify()         # already open: bring it forward
+            self.settings_win.lift()
+            self.settings_win.focus_set()
+            return
+        win = self.settings_win = tk.Toplevel(self)
+        win.title("Graph settings")
+        win.transient(self)                       # stays above the main window
+        win.resizable(False, False)
+        body = ttk.Frame(win, padding=10)
+        body.pack(fill="both", expand=True)
+
+        def section(text):
+            f = ttk.LabelFrame(body, text=text, padding=(8, 4))
+            f.pack(fill="x", pady=(0, 8))
+            f.columnconfigure(1, weight=1)
+            f.columnconfigure(3, weight=1)
+            return f
+
+        def label(f, text, row):
+            ttk.Label(f, text=text).grid(row=row, column=0, sticky="w", padx=(0, 6))
+
+        def entry(f, var, row, col, span=1):
+            e = ttk.Entry(f, textvariable=var, width=10)
+            e.grid(row=row, column=col, columnspan=span, sticky="ew", pady=1)
+            e.bind("<Return>", lambda ev: self.redraw())
+            e.bind("<FocusOut>", lambda ev: self.redraw())
+
+        t = section("Titles")
+        for row, (text, var) in enumerate((("Title", self.title_var),
+                                           ("X label", self.xlabel_var),
+                                           ("Y label", self.ylabel_var))):
+            label(t, text, row)
+            entry(t, var, row, 1, span=3)
+
+        r = section("Axis ranges")
+        for row, (text, lo, hi) in enumerate((("X range", self.xmin_var, self.xmax_var),
+                                              ("Y range", self.ymin_var, self.ymax_var),
+                                              ("Tauc X", self.tauc_xmin_var, self.tauc_xmax_var),
+                                              ("Tauc Y", self.tauc_ymin_var, self.tauc_ymax_var))):
+            label(r, text, row)
+            entry(r, lo, row, 1)
+            ttk.Label(r, text="to").grid(row=row, column=2, padx=4)
+            entry(r, hi, row, 3)
+        ttk.Label(r, text="Blank = automatic. Put the larger X first to flip it.",
+                  foreground="#666", font=("TkDefaultFont", 8)
+                  ).grid(row=4, column=0, columnspan=4, sticky="w")
+        ttk.Button(r, text="Reset axes", command=self.reset_axes
+                   ).grid(row=5, column=0, columnspan=4, sticky="e", pady=(4, 2))
+
+        c = section("Colours")
+        ttk.Label(c, text="Applies to the Y columns selected in the main window.",
+                  foreground="#666").grid(row=0, column=0, columnspan=4, sticky="w")
+        buttons = ttk.Frame(c)
+        buttons.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(4, 2))
+        ttk.Button(buttons, text="Colour group...", command=self.color_group
+                   ).pack(side="left", expand=True, fill="x")
+        ttk.Button(buttons, text="Ungroup", command=self.ungroup
+                   ).pack(side="left", expand=True, fill="x")
+        ttk.Checkbutton(c, text="Group legend (one entry per group)",
+                        variable=self.group_legend_var, command=self.redraw
+                        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(2, 2))
+
+        def close():
+            self.redraw()                         # applies a value typed without Enter
+            win.destroy()
+        ttk.Button(body, text="Close", command=close).pack(anchor="e")
+        win.protocol("WM_DELETE_WINDOW", close)
+        # open over the graph, not on top of the Y columns list
+        win.geometry(f"+{self.winfo_rootx() + 320}+{self.winfo_rooty() + 60}")
 
     def reset_axes(self):
         for var in (self.xmin_var, self.xmax_var, self.ymin_var, self.ymax_var,
