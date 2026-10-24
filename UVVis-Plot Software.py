@@ -235,6 +235,8 @@ def multi_deconvolve(ws, keys, value):
                              f"({x.min():g} to {x.max():g}).")
         if len(x) < 3 * len(centers) + 2:
             raise ValueError(f"'{key}' has too few points for {len(centers)} peaks.")
+        if np.ptp(y) <= 1e-12 * max(1.0, float(np.abs(y).max())):
+            raise ValueError(f"'{key}' is flat, so there are no peaks to fit.")
 
         if typed:
             p = fit(key, x, y, centers)
@@ -272,6 +274,7 @@ def multi_deconvolve(ws, keys, value):
         peaks = sorted((p[i:i + 3] for i in range(1, len(p), 3)), key=lambda q: q[1])
         lines = [f"{key}: {len(peaks)} peak(s), baseline = {p[0]:.4g}, R^2 = {r2:.5f}",
                  f"  {'#':>2} {'center':>9} {'height':>10} {'FWHM':>9} {'area':>10}"]
+        small = 0.01 * np.ptp(y)                # peaks below this are probably noise
         for n, (amp, center, sigma) in enumerate(peaks, 1):
             area = amp * abs(sigma) * np.sqrt(2 * np.pi)
             ws.details.append(dict(item=key, result=f"peak {n} of {len(peaks)}",
@@ -279,11 +282,16 @@ def multi_deconvolve(ws, keys, value):
                                    fwhm=GAUSS_FWHM * abs(sigma), area=area,
                                    baseline=p[0], r2=r2))
             lines.append(f"  {n:>2} {center:>9.2f} {amp:>10.4g} "
-                         f"{GAUSS_FWHM * abs(sigma):>9.2f} {area:>10.4g}")
+                         f"{GAUSS_FWHM * abs(sigma):>9.2f} {area:>10.4g}"
+                         + ("  *" if amp < small else ""))
             ws.new_item(f"{key} peak {n} @ {center:.0f}",          # drawn on the baseline
                         x, p[0] + _gauss(x, amp, center, sigma), dashed=True,
                         tauc=it.get("tauc", ""))
         ws.new_item(f"{key} fit", x, total, dashed=True, tauc=it.get("tauc", ""))
+        if any(q[0] < small for q in peaks):
+            lines.append("  * smaller than 1% of the data range: probably noise, not a real peak")
+        if not r2 >= 0.9:
+            lines.append(f"  ! Poor fit (R^2 = {r2:.3f}): try typing peak positions")
         report.append("\n".join(lines))
     return "\n".join(report)
 
@@ -323,6 +331,14 @@ def multi_tauc(ws, keys, value, kind):
             if it["x"].min() <= 0:
                 raise ValueError(f"'{key}' has X values of 0 or below. The X column "
                                  f"must be wavelength in nm.")
+            if it["x"].max() < 100:
+                raise ValueError(f"'{key}' has X values only up to {it['x'].max():g}, which "
+                                 f"doesn't look like wavelength in nm (energy in eV?). "
+                                 f"The Tauc plot needs wavelength in nm.")
+            if it["x"].min() > 3000:
+                raise ValueError(f"'{key}' has X values from {it['x'].min():g}, which doesn't "
+                                 f"look like wavelength in nm (wavenumber in cm^-1?). "
+                                 f"The Tauc plot needs wavelength in nm.")
             e = HC_EV_NM / it["x"]
             t = np.clip(it["y"] * e, 0, None) ** TAUC_POWER[kind]
             order = np.argsort(e)
@@ -352,6 +368,9 @@ def multi_tauc(ws, keys, value, kind):
         ws.details.append(dict(item=name, result=f"Eg = {eg:.3f} eV", eg=eg, r2=r2))
         report.append(f"{name}: Eg = {eg:.3f} eV  (fit {lo:g}-{hi:g} eV, "
                       f"{sel.sum()} points, R^2 = {r2:.4f})")
+        if not r2 >= 0.9:
+            report.append("  ! Not a straight line in this range (R^2 < 0.9), so this Eg "
+                          "is unreliable. Pick the straight, rising part of the edge.")
     return "\n".join(report) or None
 
 
@@ -442,7 +461,7 @@ class WorkingSet:
         Returns the item's name (made unique if 'key' is already taken)."""
         x = pd.to_numeric(pd.Series(list(x)), errors="coerce").to_numpy(float)
         y = pd.to_numeric(pd.Series(list(y)), errors="coerce").to_numpy(float)
-        ok = ~np.isnan(x) & ~np.isnan(y)
+        ok = np.isfinite(x) & np.isfinite(y)        # blanks, text and inf dropped
         x, y = x[ok], y[ok]
         if len(x) == 0:
             raise ValueError(f"'{key}' has no numeric data to move.")
@@ -475,13 +494,21 @@ class WorkingSet:
         self.details = []
 
         self.checkpoint()
+        before = set(self.items)
         try:
             if spec["kind"] == "multi":
                 report = spec["fn"](self, keys, value)
+                for k in set(self.items) - before:   # results belong to the same sheet
+                    self.items[k].setdefault("sheet", self.items[keys[0]].get("sheet"))
+                    self.items[k].setdefault("x_col", self.items[keys[0]].get("x_col"))
             else:
                 # compute everything first so one failure leaves nothing half-done
-                results = {k: spec["fn"](self.items[k]["x"], self.items[k]["y"], value)
-                           for k in keys}
+                results = {}
+                for k in keys:
+                    try:
+                        results[k] = spec["fn"](self.items[k]["x"], self.items[k]["y"], value)
+                    except ValueError as err:
+                        raise ValueError(f"'{k}': {err}\n\nNothing was changed.") from None
                 tag = spec["tag"].format(v=value).strip()
                 for k, (x, y) in results.items():
                     self.items[k]["x"] = np.asarray(x, float)
@@ -504,6 +531,22 @@ class WorkingSet:
 # ============================================================================
 # Loading and drawing (no GUI code here)
 # ============================================================================
+def _fix_decimal_commas(df):
+    """Columns written with decimal commas ("0,123", common in European
+    exports) are read as text; turn them into numbers."""
+    for c in df.columns:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            continue
+        text = df[c].dropna().astype(str).str.strip()
+        if text.empty or not text.str.contains(",").any():
+            continue
+        nums = pd.to_numeric(text.str.replace(",", ".", regex=False), errors="coerce")
+        if nums.notna().mean() > 0.9:                # (nearly) all numbers once fixed
+            df[c] = pd.to_numeric(df[c].astype(str).str.strip()
+                                  .str.replace(",", ".", regex=False), errors="coerce")
+    return df
+
+
 def load_tables(path):
     """Read a file and return {sheet_name: DataFrame}."""
     ext = os.path.splitext(path)[1].lower()
@@ -524,6 +567,7 @@ def load_tables(path):
                 name_, n = f"{base} #{n}", n + 1
             names.append(name_)
         df.columns = names
+        df = _fix_decimal_commas(df)
         if df.shape[1] >= 2 and len(df) > 0:
             cleaned[str(name)] = df
     return cleaned
@@ -541,7 +585,7 @@ def draw_plot(ax, series, style="Line", log_y=False, grid=True,
         color = color[0] if color else None
         x = pd.to_numeric(pd.Series(list(x)), errors="coerce")
         y = pd.to_numeric(pd.Series(list(y)), errors="coerce")
-        ok = x.notna() & y.notna()          # skip blanks and text cells
+        ok = np.isfinite(x) & np.isfinite(y)  # skip blanks, text cells and inf
         if ok.sum() == 0:
             continue
         if look == "fit":                    # deconvolution peaks / total fit
@@ -565,7 +609,19 @@ def draw_plot(ax, series, style="Line", log_y=False, grid=True,
         ax.set_ylim(*ylim)
     ax.grid(grid, alpha=0.3)
     if drawn:
-        ax.legend(fontsize=8 if drawn > 8 else 9, ncol=2 if drawn > 12 else 1)
+        size = 9 if drawn <= 8 else 8 if drawn <= 16 else 7
+        ncol = 1 if drawn <= 12 else 2
+        legend = ax.legend(fontsize=size, ncol=ncol)
+        try:                           # two columns wider than the graph: use one
+            r = ax.figure.canvas.get_renderer()
+            if (ncol > 1 and legend.get_window_extent(r).width
+                    > ax.get_window_extent(r).width):
+                legend.remove()
+                legend = ax.legend(fontsize=size, ncol=1)
+        except Exception:
+            pass
+        legend.set_in_layout(False)    # a big legend covers the graph, never shrinks it
+        legend.set_draggable(True)     # drag it aside with the mouse
     return drawn
 
 
@@ -772,6 +828,9 @@ class App(tk.Tk):
         self.fig = Figure(figsize=(8, 6), dpi=100, constrained_layout=True)
         self.ax = self.fig.add_subplot(111)
         self.ax_tauc = None                   # second graph, shown when there are Tauc plots
+        self._drawn = {}                      # view each graph had when last drawn
+        self._auto = {}                       # its automatic / typed view (what Home gives)
+        self._zoom = {}                       # toolbar zoom or pan to keep across redraws
         self.ax.text(0.5, 0.5, "Open a file to begin", ha="center", va="center",
                      color="#888", fontsize=14, transform=self.ax.transAxes)
         self.ax.set_axis_off()
@@ -828,6 +887,7 @@ class App(tk.Tk):
         self.on_x_change()
 
     def on_x_change(self):
+        self._drawn, self._zoom = {}, {}      # new data: start from the full view
         self.refresh_available(select_all=True)
         self.redraw()
 
@@ -931,6 +991,7 @@ class App(tk.Tk):
         for col in cols:
             try:
                 key = self.ws.add(self.key_for(col), x, self.df[col])
+                self.ws.items[key].update(sheet=self.sheet_box.get(), x_col=self.x_box.get())
                 self.log_event("Move to working list", item=key)
             except ValueError:
                 skipped.append(col)
@@ -951,10 +1012,15 @@ class App(tk.Tk):
                                 "Y columns.")
             return
         self.ws.checkpoint(extra=self._column_state())
-        sheet_x = pd.to_numeric(self.df[self.x_box.get()], errors="coerce").to_numpy(float)
-        added, failed, tauc = [], [], []
+        added, failed, tauc, elsewhere = [], [], [], []
         for k in keys:
             it = self.ws.items[k]
+            # back to the sheet (and X column) the item came from
+            sheet = it.get("sheet") if it.get("sheet") in self.tables else self.sheet_box.get()
+            df = self.tables[sheet]
+            x_col = it.get("x_col") if it.get("x_col") in df.columns else (
+                self.x_box.get() if sheet == self.sheet_box.get() else df.columns[0])
+            sheet_x = pd.to_numeric(df[x_col], errors="coerce").to_numpy(float)
             if it.get("tauc"):
                 tauc.append(k)
                 continue
@@ -967,10 +1033,14 @@ class App(tk.Tk):
             if np.isnan(y).all():
                 failed.append(k)
                 continue
-            name = self._unique_column(self.ws.label(k).replace("  [", " ["))
-            self.df[name] = y
-            added.append(name)
-            self.log_event("Move to Y columns", item=k, result=f"new column '{name}'")
+            name = self._unique_column(self.ws.label(k).replace("  [", " ["), df)
+            df[name] = y
+            if sheet == self.sheet_box.get():
+                added.append(name)
+            else:
+                elsewhere.append(f"{name}  (sheet '{sheet}')")
+            self.log_event("Move to Y columns", item=k,
+                           result=f"new column '{name}' on sheet '{sheet}'")
         self.ws.remove([k for k in keys if k not in failed and k not in tauc])
         if tauc:
             messagebox.showwarning("Not moved",
@@ -979,16 +1049,20 @@ class App(tk.Tk):
                                    + "\n".join(tauc))
         if failed:
             messagebox.showwarning("Not moved",
-                                   "These don't overlap this sheet's X values, so they "
+                                   "These don't overlap their sheet's X values, so they "
                                    "stayed in the working list:\n" + "\n".join(failed))
+        if elsewhere:
+            messagebox.showinfo("Added to another sheet",
+                                "These came from another sheet, so they were added "
+                                "there:\n" + "\n".join(elsewhere))
         self.w_list.selection_clear(0, "end")
         self.refresh_available(also_select=added)
         self.refresh_working()
         self.redraw()
 
-    def _unique_column(self, base):
+    def _unique_column(self, base, df):
         name, n = base, 2
-        while name in self.df.columns:
+        while name in df.columns:
             name, n = f"{base} #{n}", n + 1
         return name
 
@@ -1117,6 +1191,7 @@ class App(tk.Tk):
                 for k, it in self.ws.items.items()]
         series += [w[:4] for w in work if not w[4]]
         tauc = [w for w in work if w[4]]
+        self._note_zoom()
         free = iter(self._free_colors() * 50)
         series = [(*s[:4], s[4] if len(s) > 4 and s[4] else next(free)) for s in series]
         self._set_panels(bool(tauc))
@@ -1142,7 +1217,39 @@ class App(tk.Tk):
                       ylim=(self._axis_value(self.tauc_ymin_var),
                             self._axis_value(self.tauc_ymax_var)))
             self.ax_tauc.axhline(0, color="#888", linewidth=0.8)
+        self._keep_zoom()
         self.canvas.draw_idle()
+
+    def _graphs(self):
+        """name -> (axes, typed X range vars, typed Y range vars)"""
+        g = {"top": (self.ax, (self.xmin_var, self.xmax_var), (self.ymin_var, self.ymax_var))}
+        if self.ax_tauc is not None:
+            g["tauc"] = (self.ax_tauc, (self.tauc_xmin_var, self.tauc_xmax_var),
+                         (self.tauc_ymin_var, self.tauc_ymax_var))
+        return g
+
+    def _note_zoom(self):
+        """Notice a toolbar zoom or pan made since the last draw (or Home)."""
+        for name, (ax, _, _) in self._graphs().items():
+            view = (ax.get_xlim(), ax.get_ylim(), ax.get_yscale())
+            if name in self._drawn and view != self._drawn[name]:
+                if view == self._auto.get(name):
+                    self._zoom.pop(name, None)    # back to the full view (Home)
+                else:
+                    self._zoom[name] = view
+
+    def _keep_zoom(self):
+        """Put a toolbar zoom back after redrawing (typed axis ranges win), then
+        remember the views so the next redraw can tell if they change."""
+        for name, (ax, xvars, yvars) in self._graphs().items():
+            self._auto[name] = (ax.get_xlim(), ax.get_ylim(), ax.get_yscale())
+            zoom = self._zoom.get(name)
+            if zoom and zoom[2] == ax.get_yscale():
+                if all(self._axis_value(v) is None for v in xvars):
+                    ax.set_xlim(zoom[0])
+                if all(self._axis_value(v) is None for v in yvars):
+                    ax.set_ylim(zoom[1])
+            self._drawn[name] = (ax.get_xlim(), ax.get_ylim(), ax.get_yscale())
 
     def _set_panels(self, tauc):
         """One graph, or two stacked when there are Tauc plots (spectra on
@@ -1155,6 +1262,7 @@ class App(tk.Tk):
         else:
             self.ax, self.ax_tauc = self.fig.add_subplot(111), None
         self.toolbar.update()                 # reset zoom history for the new graphs
+        self._drawn, self._zoom = {}, {}
 
     @staticmethod
     def _axis_value(var):
@@ -1243,6 +1351,7 @@ class App(tk.Tk):
                     self.tauc_xmin_var, self.tauc_xmax_var,
                     self.tauc_ymin_var, self.tauc_ymax_var):
             var.set("")
+        self._drawn, self._zoom = {}, {}      # also undo any toolbar zoom
         self.redraw()
 
     def save_image(self):
