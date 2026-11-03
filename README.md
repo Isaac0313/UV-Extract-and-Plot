@@ -41,15 +41,47 @@ between the two at any moment. The question it answers: *given a starting positi
 - particle + wave: the particle feels the wave's charge cloud; the wave feels the particle's point charge.
 - wave + wave: each wave feels the other's charge cloud (time-dependent Hartree / mean field). This keeps the cost at two 2D grids instead of one 4D grid, but leaves out electron correlation. The electrons are taken to have opposite spins, so both may occupy σ.
 
-## Dependencies
-- numpy, matplotlib, tkinter (`python -m pip install numpy matplotlib`; on Linux also `sudo apt install python3-tk`)
+## Three versions
+All three have the same buttons, sliders and physics; keep all the files below in one folder.
 
-## Running
+| Program | Window | Physics | Install |
+|---|---|---|---|
+| `MO-Electron-Simulator.py` | tkinter + matplotlib | NumPy | `pip install numpy matplotlib` (+ `python3-tk` on Linux) |
+| `MO-Electron-Simulator-JAX.py` | tkinter + matplotlib | JAX (CPU, or NVIDIA GPU) | also `pip install jax` (GPU: `pip install "jax[cuda12]"`) |
+| `MO-Electron-Simulator-Qt.py` | pyqtgraph (Qt) | NumPy, or JAX with `--jax` | `pip install numpy pyqtgraph PyQt6` (+ `jax` for `--jax`) |
+
+Shared modules: `mo_physics.py` (NumPy physics + self-test), `mo_physics_jax.py` (the same physics compiled with JAX), `mo_controller.py` (what the buttons/sliders do, used by both windows).
+
 ```bash
 python MO-Electron-Simulator.py
 ```
 ```bash
+python MO-Electron-Simulator-JAX.py
+```
+```bash
+python MO-Electron-Simulator-Qt.py --jax --fp32
+```
+- `--jax` (tkinter and Qt programs): use the JAX physics.
+- `--fp32`: run JAX in single precision. About 2x faster FFTs on a CPU, and the right choice on consumer NVIDIA GPUs, whose 64-bit maths is much slower. Results agree with 64-bit to the digits shown.
+- The first time a combination of settings is used (1 or 2 electrons, particle or wave, vibrating nuclei, ...), JAX compiles it: a pause of a second or two.
+
+Measured frame rates on a 4-core CPU without a GPU (higher is better):
+
+| Case | tkinter, NumPy | pyqtgraph, NumPy | pyqtgraph, JAX 32-bit |
+|---|---|---|---|
+| 1 particle | ~45 fps | ~63 fps | ~61 fps |
+| 1 wave | ~34 fps | ~30 fps | ~41 fps |
+| 2 waves | ~14 fps | ~16 fps | ~25 fps |
+| 2 waves + vibrating nuclei | ~7 fps (10 steps/frame) | ~11 fps | ~20 fps |
+
+On a CPU the wave cases are limited by the FFTs; a GPU with JAX should help most there.
+
+## Self-test
+```bash
 python MO-Electron-Simulator.py --selftest
+```
+```bash
+python MO-Electron-Simulator-JAX.py --selftest
 ```
 `--selftest` runs physics checks without opening a window (energy and norm conservation for one and two electrons, orbital symmetry, measurement statistics, the two-electron ground state, forces on the nuclei, energy conservation with vibrating nuclei).
 
