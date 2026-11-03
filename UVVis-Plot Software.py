@@ -30,6 +30,7 @@ from tkinter import ttk, filedialog, messagebox, simpledialog, colorchooser
 
 import numpy as np
 import pandas as pd
+from matplotlib.colors import to_hex
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
@@ -647,6 +648,7 @@ class App(tk.Tk):
         self.file_name = ""
         self.colors = {}           # colour groups: Y column name -> colour
         self.group_names = {}      # colour -> group name (for the grouped legend)
+        self._line_colors = {}     # Y column -> colour of its line on the graph now
 
         self._build_header()
         self._build_left_panel()
@@ -695,6 +697,16 @@ class App(tk.Tk):
         self.y_list = self._listbox(side, "multiple")
         self.y_list.config(selectbackground="#cfe0f5", selectforeground="black")
         self.y_list.bind("<<ListboxSelect>>", lambda e: self.redraw())
+        self.y_list.bind("<Double-Button-1>", self._double_click_column)
+        # a square after each name showing its line colour; click it to change
+        self.swatches = tk.Canvas(self.y_list.master, width=16, highlightthickness=0,
+                                  bd=0, bg=self.y_list.cget("bg"), cursor="hand2")
+        self.swatches.pack(side="right", fill="y")
+        self.swatches.bind("<Button-1>", self._swatch_click)
+        sb = self.y_list.scrollbar
+        self.y_list.config(yscrollcommand=lambda first, last: (sb.set(first, last),
+                                                               self._draw_swatches()))
+        self.y_list.bind("<Configure>", lambda e: self._draw_swatches(), add="+")
         side = lower
 
         row = ttk.Frame(side)
@@ -702,6 +714,8 @@ class App(tk.Tk):
         ttk.Button(row, text="All", command=lambda: self.select_y(True), width=1
                    ).pack(side="left", expand=True, fill="x")
         ttk.Button(row, text="None", command=lambda: self.select_y(False), width=1
+                   ).pack(side="left", expand=True, fill="x")
+        ttk.Button(row, text="Rename", command=self.rename_column, width=1
                    ).pack(side="left", expand=True, fill="x")
         ttk.Button(side, text="Move selected to working list  →",
                    command=self.move_to_working).pack(fill="x", pady=(2, 4))
@@ -819,6 +833,7 @@ class App(tk.Tk):
         lb.config(yscrollcommand=scroll.set)
         lb.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
+        lb.scrollbar = scroll
         return lb
 
     def _build_plot_area(self):
@@ -910,6 +925,7 @@ class App(tk.Tk):
                 self.y_list.itemconfig(i, foreground=color, selectforeground=color)
             if select_all or name in keep:
                 self.y_list.select_set(i)
+        self._draw_swatches()
 
     def color_group(self):
         """Give the selected Y columns one colour on the graph."""
@@ -935,6 +951,82 @@ class App(tk.Tk):
         self.log_event("Colour group", item=", ".join(cols),
                        result=f"{self.group_names[color]} ({color})")
         self.refresh_available()
+        self.redraw()
+
+    def _draw_swatches(self):
+        """A square after each Y column name: the colour of its line (grouped or
+        automatic), or an empty square when it isn't on the graph."""
+        c = self.swatches
+        c.delete("all")
+        for i, name in enumerate(self.y_names):
+            box = self.y_list.bbox(i)             # None when scrolled out of view
+            if not box:
+                continue
+            y = box[1] + box[3] // 2
+            color = self.colors.get(self.key_for(name)) or self._line_colors.get(name)
+            c.create_rectangle(3, y - 5, 13, y + 5, fill=color or "",
+                               outline=color or "#999")
+
+    def _swatch_click(self, event):
+        """Click a column's square to pick a colour for that one column."""
+        i = self.y_list.nearest(event.y)
+        box = self.y_list.bbox(i) if self.y_names else None
+        if not box or not box[1] <= event.y <= box[1] + box[3]:
+            return
+        col = self.y_names[i]
+        key = self.key_for(col)
+        color = colorchooser.askcolor(title=f"Colour for '{col}'",
+                                      initialcolor=self.colors.get(key)
+                                      or self._line_colors.get(col), parent=self)[1]
+        if not color:
+            return
+        self.colors[key] = color
+        self.group_names.setdefault(color, col)   # its name in the grouped legend
+        self.log_event("Colour", item=col, result=color)
+        self.refresh_available()
+        self.redraw()
+
+    def _double_click_column(self, event):
+        """Double-click a Y column to rename it. The first click of the pair
+        toggled it on or off the graph, so toggle it back first."""
+        if not self.y_names:
+            return
+        i = self.y_list.nearest(event.y)
+        if self.y_list.selection_includes(i):
+            self.y_list.selection_clear(i)
+        else:
+            self.y_list.select_set(i)
+        self.redraw()
+        self.rename_column(self.y_names[i])
+
+    def rename_column(self, col=None):
+        """Rename a Y column (here only; the file isn't changed). Without a
+        column given, uses the one selected Y column."""
+        if col is None:
+            sel = [self.y_names[i] for i in self.y_list.curselection()]
+            if len(sel) != 1:
+                messagebox.showinfo("Rename", "Select just one Y column to rename\n"
+                                              "(or double-click its name).")
+                return
+            col = sel[0]
+        new = simpledialog.askstring("Rename column", f"New name for '{col}':",
+                                     initialvalue=col, parent=self)
+        if new is None or not new.strip() or new.strip() == col:
+            return
+        new = new.strip()
+        if new in self.df.columns:
+            messagebox.showerror("Could not rename", f"There is already a column called '{new}'.")
+            return
+        sheet = self.sheet_box.get()
+        shown = col in [self.y_names[i] for i in self.y_list.curselection()]
+        self.ws.checkpoint(extra=(self._column_state(), (sheet, col, new)))
+        self.tables[sheet] = self.df = self.df.rename(columns={col: new})
+        if self.key_for(col) in self.colors:
+            self.colors[self.key_for(new)] = self.colors.pop(self.key_for(col))
+        self.x_box.config(values=list(self.df.columns))
+        self.log_event("Rename column", item=col, result=new)
+        self.refresh_available(also_select=[new] if shown else ())
+        self.refresh_working()                    # enables Undo
         self.redraw()
 
     def _free_colors(self):
@@ -1104,16 +1196,29 @@ class App(tk.Tk):
 
     def undo(self):
         columns = self.ws.undo()
-        if columns:                           # remove Y columns added since then
+        renamed, also = None, ()
+        if isinstance(columns, tuple):        # undoing a Y column rename
+            columns, renamed = columns
+        if columns:                           # remove Y columns added since, undo renames
             for sheet, cols in columns.items():
-                if sheet in self.tables:
-                    self.tables[sheet] = self.tables[sheet][cols]
+                if sheet in self.tables:      # columns are only ever added at the end
+                    self.tables[sheet] = self.tables[sheet].iloc[:, :len(cols)].set_axis(
+                        cols, axis=1)
             self.df = self.tables[self.sheet_box.get()]
+            self.x_box.config(values=list(self.df.columns))
             if self.x_box.get() not in self.df.columns:
                 self.on_sheet_change()
+        if renamed:
+            sheet, old, new = renamed
+            key_old = f"{old} ({sheet})" if len(self.tables) > 1 else old
+            key_new = f"{new} ({sheet})" if len(self.tables) > 1 else new
+            if key_new in self.colors:
+                self.colors[key_old] = self.colors.pop(key_new)
+            if new in [self.y_names[i] for i in self.y_list.curselection()]:
+                also = [old]
         self.w_list.selection_clear(0, "end")
         self.log_event("Undo")
-        self.refresh_available()
+        self.refresh_available(also_select=also)
         self.refresh_working()
         self.redraw()
 
@@ -1194,6 +1299,9 @@ class App(tk.Tk):
         self._note_zoom()
         free = iter(self._free_colors() * 50)
         series = [(*s[:4], s[4] if len(s) > 4 and s[4] else next(free)) for s in series]
+        shown = [self.y_names[i] for i in self.y_list.curselection()]
+        self._line_colors = {c: to_hex(s[4]) for c, s in zip(shown, series)}  # originals first
+        self._draw_swatches()
         self._set_panels(bool(tauc))
         self.ax.set_axis_on()
         self.ax.set_yscale("linear")
