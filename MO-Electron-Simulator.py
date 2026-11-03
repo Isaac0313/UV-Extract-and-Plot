@@ -40,6 +40,19 @@ Two electrons:
     one 4D grid, at the price of ignoring electron correlation. The
     electrons are taken to have opposite spins, so both may sit in sigma.
 
+Vibrating nuclei ("Nuclei vibrate" option):
+  The two nuclei become heavy classical particles that move along the bond
+  axis (vibration; no rotation). They repel each other (Z1*Z2/R) and are
+  pulled by the electrons: by a particle electron's point charge, or by a
+  wave electron's charge cloud (Ehrenfest / Hellmann-Feynman forces). Each
+  time step the nuclei move, the potential the electrons feel is rebuilt,
+  and the electrons respond. The energy shown then includes the nuclei, and
+  the bottom-right plot shows the bond length R(t). Real hydrogen nuclei
+  weigh 1836 electron masses, so a vibration takes ~10 fs; the mass slider
+  makes them lighter to speed it up. Set R away from the balance point
+  (R slider) to start a vibration; moving the slider puts the nuclei back at
+  rest at the new R.
+
 Mouse: click in the molecule plot to put an electron there; click-and-drag
 to also give it a velocity. Waves stay waves, particles stay particles.
 
@@ -63,8 +76,11 @@ Model assumptions (keep them in mind when interpreting results):
     so both the grid and Newton's equations stay well behaved; a -> 0 is the
     true Coulomb potential. Because of the 2D geometry and the softening,
     energies differ from real 3D H2+ / H2.
-  * Nuclei are fixed (Born-Oppenheimer). Reported energies are electronic;
-    the nucleus-nucleus repulsion Z1*Z2/R is shown separately.
+  * Nuclei are fixed (Born-Oppenheimer) unless "Nuclei vibrate" is on; then
+    they are classical point masses moving along the bond axis. With fixed
+    nuclei the reported energies are electronic and the nucleus-nucleus
+    repulsion Z1*Z2/R is shown separately; with moving nuclei the energy
+    includes their repulsion and kinetic energy.
   * Absorbing edges (optional) remove the part of a wave that leaves the
     box, so its norm is the probability that the electron is still bound.
 """
@@ -99,6 +115,7 @@ ESCAPE_DISTANCE = BOX_SIZE / 2 - ABSORBER_WIDTH - 2.0   # beyond this an electro
 RELAX_TOL = 1e-8          # hartree; relaxing stops when the energy changes less than this
 RELAX_MAX_STEPS = 6000    # give up after this many imaginary-time steps
 ORBITAL_REGION_FRACTION = 0.9   # the "inside the orbital" region holds this much of sigma
+SIGMA_TRACK_STEPS = 3     # per frame, keeps the sigma orbital matched to moving nuclei
 
 DEFAULTS = dict(
     R=2.0,        # bond length, bohr
@@ -108,6 +125,7 @@ DEFAULTS = dict(
     sigma=0.6,    # wave packet width, bohr
     steps=5,      # time steps per animation frame (simulation speed)
     rate=0.05,    # auto switch events per a.u. of time
+    mass=1836,    # mass of each nucleus in electron masses (hydrogen: 1836)
 )
 START = [((0.0, 1.2), (0.75, 0.0)),      # electron 1: position (bohr), momentum (a.u.)
          ((0.0, -1.2), (-0.75, 0.0))]    # electron 2
@@ -122,6 +140,7 @@ HISTORY_LEN = 1500
 DISPLAY_GAMMA = 0.5       # brightness = (density / max)^gamma, < 1 shows faint tails
 CLOUD_BLUR = 0.3          # smoothing of the classical cloud picture, bohr
 
+PROTON_MASS = 1836.15     # electron masses
 AU_TIME_FS = 0.02418884
 HARTREE_EV = 27.211386
 
@@ -145,18 +164,50 @@ class TwoCenterSystem:
         self.T = 0.5 * (self.KX ** 2 + self.KY ** 2)           # kinetic energy in k space
         d = np.fft.fftfreq(n, 1.0 / (n * self.dx))             # displacements 0, dx, ..., -dx
         self._DX, self._DY = np.meshgrid(d, d)
-        self.version = 0
+        self.version = 0          # changes whenever the potential changes (also when nuclei move)
+        self.params_version = 0   # changes only when charges / softening / R are set
         self.set_params(R, Z1, Z2, soft)
 
     def set_params(self, R, Z1, Z2, soft):
-        self.R, self.Z1, self.Z2, self.soft = float(R), float(Z1), float(Z2), float(soft)
-        self.nuclei = [(-self.R / 2, self.Z1), (self.R / 2, self.Z2)]
-        self.V = self.potential(self.X, self.Y)
+        """Set charges and softening, and place the nuclei at -R/2 and +R/2."""
+        self.Z1, self.Z2, self.soft = float(Z1), float(Z2), float(soft)
+        self._Y2a = self.Y ** 2 + self.soft ** 2
         # Electron-electron kernel 1/sqrt(d^2 + a^2) in k space, for the
         # Hartree potential of a charge cloud (exact for |r - r'| < box / 2).
         kernel = 1.0 / np.sqrt(self._DX ** 2 + self._DY ** 2 + self.soft ** 2)
         self.ee_kernel_k = np.fft.rfft2(kernel) * self.dA
+        self.params_version += 1
+        self.set_positions(-float(R) / 2, float(R) / 2)
+
+    def set_positions(self, x1, x2):
+        """Move the nuclei along the x axis (x1 < x2) and update the potential."""
+        self.x1, self.x2 = float(x1), float(x2)
+        self.R = self.x2 - self.x1
+        self.nuclei = [(self.x1, self.Z1), (self.x2, self.Z2)]
         self.version += 1
+
+    def _grid_arrays(self):
+        # Grid potential V and nuclear-force kernels G, rebuilt only when asked for
+        # (moving nuclei with particle electrons never need them).
+        if getattr(self, "_grid_version", None) != self.version:
+            V = 0.0
+            G = []         # force on each nucleus per unit electron density, x component
+            for xn, z in self.nuclei:
+                d = self.X - xn
+                inv = 1.0 / np.sqrt(d * d + self._Y2a)
+                V = V - z * inv
+                G.append(z * d * inv ** 3)
+            self._V, self._G, self._grid_version = V, G, self.version
+
+    @property
+    def V(self):
+        self._grid_arrays()
+        return self._V
+
+    @property
+    def G(self):
+        self._grid_arrays()
+        return self._G
 
     # -- electron-nucleus ---------------------------------------------------
     def potential(self, x, y):
@@ -178,7 +229,22 @@ class TwoCenterSystem:
         return fx, fy
 
     def nuclear_repulsion(self):
-        return self.Z1 * self.Z2 / self.R
+        return self.Z1 * self.Z2 / max(self.R, 1e-3)
+
+    # -- forces on the nuclei (along the bond axis) -------------------------
+    def nn_forces(self):
+        """Nucleus-nucleus Coulomb repulsion: pushes nucleus 1 left, nucleus 2 right."""
+        f = self.Z1 * self.Z2 / max(self.R, 1e-3) ** 2
+        return [-f, f]
+
+    def nuclear_forces_point(self, x, y):
+        """Pull of a point electron at (x, y) on each nucleus."""
+        a2 = self.soft ** 2
+        return [z * (x - xn) / ((x - xn) ** 2 + y * y + a2) ** 1.5 for xn, z in self.nuclei]
+
+    def nuclear_forces_density(self, rho):
+        """Pull of an electron charge cloud rho on each nucleus."""
+        return [float(np.sum(rho * g) * self.dA) for g in self.G]
 
     # -- electron-electron --------------------------------------------------
     def ee_energy(self, x1, y1, x2, y2):
@@ -312,12 +378,24 @@ class QuantumElectron:
         return np.outer(m, m)
 
     def rebuild(self):
-        """Call after the potential changes."""
+        """Call after the molecule changes. The potential factors are rebuilt
+        automatically (lazily) whenever the potential changes, e.g. nuclei moving."""
         s = self.sys
-        self.half_v = np.exp(-0.5j * DT * s.V)
         self.kin = np.exp(-1j * DT * s.T)
-        self.half_v_im = np.exp(-0.5 * IMAG_DT * s.V)
         self.kin_im = np.exp(-IMAG_DT * s.T)
+        self._hv = self._hvi = (None, None)
+
+    @property
+    def half_v(self):
+        if self._hv[0] != self.sys.version:
+            self._hv = (self.sys.version, np.exp(-0.5j * DT * self.sys.V))
+        return self._hv[1]
+
+    @property
+    def half_v_im(self):
+        if self._hvi[0] != self.sys.version:
+            self._hvi = (self.sys.version, np.exp(-0.5 * IMAG_DT * self.sys.V))
+        return self._hvi[1]
 
     # -- creating states ----------------------------------------------------
     def normalized(self, psi):
@@ -462,6 +540,9 @@ class Simulation:
         self.electrons = [Electron(system, absorb), Electron(system, absorb)]
         self.count = 1
         self.t = 0.0
+        self.nuclei_move = False          # True: nuclei vibrate along the bond axis
+        self.nuclear_mass = PROTON_MASS   # mass of each nucleus, in electron masses
+        self.nuc_p = [0.0, 0.0]           # nuclear momenta along x
 
     def active(self):
         return self.electrons[:self.count]
@@ -489,8 +570,36 @@ class Simulation:
             return self.sys.ee_point(e.particle.x, e.particle.y)
         return self.sys.hartree(e.density())
 
+    def nuclear_forces(self):
+        """Total force on each nucleus along the bond axis: the other nucleus
+        pushes, the electrons pull (point charge or charge cloud)."""
+        s = self.sys
+        f = s.nn_forces()
+        for e in self.active():
+            if e.mode == "particle":
+                g = s.nuclear_forces_point(e.particle.x, e.particle.y)
+            else:
+                g = s.nuclear_forces_density(e.density())
+            f = [f[0] + g[0], f[1] + g[1]]
+        return f
+
     def step(self, clouds=(None, None)):
-        """Advance all active electrons by DT."""
+        """Advance everything by DT. With moving nuclei: half kick, move the
+        nuclei, evolve the electrons in the new potential, half kick."""
+        if not self.nuclei_move:
+            self._step_electrons(clouds)
+            self.t += DT
+            return
+        s, m = self.sys, self.nuclear_mass
+        f = self.nuclear_forces()
+        p = [self.nuc_p[k] + 0.5 * DT * f[k] for k in range(2)]
+        s.set_positions(s.x1 + DT * p[0] / m, s.x2 + DT * p[1] / m)
+        self._step_electrons(clouds)
+        f = self.nuclear_forces()
+        self.nuc_p = [p[k] + 0.5 * DT * f[k] for k in range(2)]
+        self.t += DT
+
+    def _step_electrons(self, clouds):
         s = self.sys
         els = self.active()
         if len(els) == 1:
@@ -514,7 +623,6 @@ class Simulation:
                     def extra(x, y, gx=gx, gy=gy):
                         return -s.interp(gx, x, y), -s.interp(gy, x, y)
                     e.particle.step(DT, cloud=clouds[k], extra_force=extra)
-        self.t += DT
 
     def relax(self, idxs, n, project=None):
         """n imaginary-time steps for the electrons in idxs (must be waves); the
@@ -567,7 +675,13 @@ class Simulation:
             else:
                 w, p = (a, b) if a["mode"] == "wave" else (b, a)
                 vee = float(np.sum(w["rho"] * s.ee_point(p["x"], p["y"])) * s.dA)
-        return dict(electrons=infos, T=t_sum, V=vn_sum + vee, Vee=vee, E=t_sum + vn_sum + vee)
+        out = dict(electrons=infos, T=t_sum, V=vn_sum + vee, Vee=vee, E=t_sum + vn_sum + vee,
+                   E_el=t_sum + vn_sum + vee, R=s.R, Vnn=s.nuclear_repulsion(), Tnuc=0.0)
+        if self.nuclei_move:
+            # Everything moves, so the conserved energy includes the nuclei.
+            tn = sum(p * p for p in self.nuc_p) / (2 * self.nuclear_mass)
+            out.update(Tnuc=tn, T=t_sum + tn, V=out["V"] + out["Vnn"], E=out["E"] + out["Vnn"] + tn)
+        return out
 
 
 def orbital_region(psi, dA, frac=ORBITAL_REGION_FRACTION):
@@ -735,6 +849,55 @@ def run_selftest():
           f"shared sigma E = {e_sym:.4f} Ha, one electron per atom E = {e_brk:.4f} Ha, "
           f"<x> = {xs[0]:.2f}, {xs[1]:.2f}")
 
+    print("-- moving nuclei (vibration) --")
+    # 13. Force on a nucleus = minus the slope of the energy (Hellmann-Feynman).
+    sh = TwoCenterSystem(2.0, 1.0, 1.0, p["soft"])
+    qh = QuantumElectron(sh, absorb=False)
+    h = 0.02
+    e_side = []
+    for x2 in (1.0 - h, 1.0 + h):
+        sh.set_positions(-1.0, x2)
+        e_side.append(qh.solve_state(qh.lcao(+1), tol=1e-11)[1] + sh.nuclear_repulsion())
+    sh.set_positions(-1.0, 1.0)
+    gs, _ = qh.solve_state(qh.lcao(+1), tol=1e-11)
+    f_num = -(e_side[1] - e_side[0]) / (2 * h)
+    f_hf = sh.nuclear_forces_density(np.abs(gs) ** 2)[1] + sh.nn_forces()[1]
+    check("force on nucleus = -dE/dR", abs(f_hf - f_num) < 1e-3,
+          f"from the charge cloud {f_hf:+.5f}, from the energy slope {f_num:+.5f} Ha/bohr")
+
+    # 14. Two particles + moving nuclei (real H mass): total energy conserved.
+    sv = TwoCenterSystem(1.6, 1.0, 1.0, p["soft"])
+    simv = Simulation(sv, absorb=False)
+    simv.count = 2
+    simv.nuclei_move = True
+    simv.electrons[0].set_particle(pos1, mom1)
+    simv.electrons[1].set_particle(pos2, mom2)
+    e0 = simv.observe()["E"]
+    emax, rs = 0.0, []
+    for _ in range(10000):                      # 200 a.u.
+        simv.step()
+        emax = max(emax, abs(simv.observe()["E"] - e0))
+        rs.append(sv.R)
+    check("vibrating nuclei + two particles: energy conservation", emax < 1e-3 * abs(e0),
+          f"E0 = {e0:.5f} Ha, max drift = {emax:.2e} Ha, R between {min(rs):.3f} and {max(rs):.3f} bohr")
+
+    # 15. One wave in sigma + moving nuclei (lighter mass): energy conserved, the
+    #     bond starts to stretch toward its equilibrium length (> 2 bohr here).
+    sv = TwoCenterSystem(2.0, 1.0, 1.0, p["soft"])
+    simv = Simulation(sv, absorb=False)
+    simv.nuclei_move = True
+    simv.nuclear_mass = 200.0
+    qv = simv.electrons[0].wave
+    simv.electrons[0].mode = "wave"
+    qv.psi = qv.solve_state(qv.lcao(+1))[0]
+    e0 = simv.observe()["E"]
+    emax = 0.0
+    for _ in range(1000):                       # 20 a.u.
+        simv.step()
+        emax = max(emax, abs(simv.observe()["E"] - e0))
+    check("vibrating nuclei + wave: energy conservation and stretch", emax < 2e-3 and sv.R > 2.02,
+          f"E0 = {e0:.5f} Ha, max drift = {emax:.2e} Ha, R: 2.000 -> {sv.R:.3f} bohr")
+
     print("ALL CHECKS PASSED" if ok else "SOME CHECKS FAILED")
     return ok
 
@@ -809,12 +972,14 @@ def run_app(root=None, mainloop=True):
 
             # --- figure -------------------------------------------------------
             self.fig = Figure(figsize=(9.6, 6.4), dpi=100)
-            gs = self.fig.add_gridspec(3, 2, width_ratios=[1.25, 1], hspace=0.62, wspace=0.25,
-                                       left=0.075, right=0.98, top=0.94, bottom=0.08)
+            gs = self.fig.add_gridspec(4, 2, width_ratios=[1.25, 1], height_ratios=[1.25, 1, 0.8, 0.8],
+                                       hspace=0.6, wspace=0.25,
+                                       left=0.075, right=0.98, top=0.95, bottom=0.07)
             self.ax = self.fig.add_subplot(gs[:, 0])
             self.ax_cut = self.fig.add_subplot(gs[0, 1])
             self.ax_e = self.fig.add_subplot(gs[1, 1])
             self.ax_in = self.fig.add_subplot(gs[2, 1], sharex=self.ax_e)
+            self.ax_r = self.fig.add_subplot(gs[3, 1], sharex=self.ax_e)
             self.canvas = FigureCanvasTkAgg(self.fig, master=body)
             self.canvas.get_tk_widget().pack(side="left", fill="both", expand=True)
             self._build_axes()
@@ -835,9 +1000,7 @@ def run_app(root=None, mainloop=True):
             for n in (1, 2):
                 ttk.Radiobutton(row, text=str(n), value=n, variable=self.count_var,
                                 command=self.on_count).pack(side="left")
-            row = tk.Frame(box)
-            row.grid(row=2, column=0, columnspan=2, sticky="w", padx=2)
-            tk.Label(row, text="Act on:").pack(side="left")
+            tk.Label(row, text="  Act on:").pack(side="left")
             self.target_var = tk.StringVar(value="1")
             self.target_buttons = []
             for val, text in (("1", "e₁"), ("2", "e₂"), ("both", "both")):
@@ -866,6 +1029,7 @@ def run_app(root=None, mainloop=True):
             self._slider(box, "Z1", "Left nucleus charge Z₁", 0.5, 3.0, 0.05, self.on_molecule)
             self._slider(box, "Z2", "Right nucleus charge Z₂", 0.5, 3.0, 0.05, self.on_molecule)
             self._slider(box, "soft", "Soft-core a (bohr)", 0.2, 1.5, 0.05, self.on_molecule)
+            self._slider(box, "mass", "Nuclear mass (H = 1836)", 20, 3700, 1, self.on_mass)
 
             box = ttk.LabelFrame(panel, text="Simulation")
             box.pack(fill="x", pady=3)
@@ -880,7 +1044,8 @@ def run_app(root=None, mainloop=True):
                                    ("ghost", "Classical ghost (1 electron)", True),
                                    ("cloud", "Classical cloud (time average)", False),
                                    ("absorb", "Absorbing edges (ionization)", True),
-                                   ("phase", "Show phase (1 electron)", False)]:
+                                   ("phase", "Show phase (1 electron)", False),
+                                   ("vibrate", "Nuclei vibrate (bond can stretch)", False)]:
                 v = tk.BooleanVar(value=val)
                 ttk.Checkbutton(box, text=text, variable=v, command=self.on_flag).pack(anchor="w")
                 self.flags[key] = v
@@ -912,7 +1077,7 @@ def run_app(root=None, mainloop=True):
             ax.set_ylim(-VIEW_HALF_WIDTH, VIEW_HALF_WIDTH)
             ax.set_xlabel("x (bohr)")
             ax.set_ylabel("y (bohr)")
-            self.title = ax.set_title("")
+            self.title = ax.set_title("", fontsize=10)
             self.contours = None
             self.nuclei_art = ax.scatter([], [], s=[], c="#e8483b", edgecolors="white",
                                          linewidths=1.2, zorder=5)
@@ -929,17 +1094,17 @@ def run_app(root=None, mainloop=True):
             (self.drag_line,) = ax.plot([], [], "-", color="#ffe066", lw=2, zorder=8)
 
             a = self.ax_cut
-            a.set_xlabel("x along the bond, cut at y = 0 (bohr)", fontsize=9)
             a.set_ylabel("energy (Ha)")
-            (self.cut_v,) = a.plot(s.x, s.V[s.n // 2], color="#555", lw=1.5, label="V(x, 0)")
+            a.tick_params(labelsize=8)
+            (self.cut_v,) = a.plot(s.x, s.V[s.n // 2], color="#555", lw=1.5, label="V along bond")
             self.cut_rhos, self.cut_dots = [], []
             for k, col in enumerate(ELECTRON_LINE_COLORS):
                 (line,) = a.plot([], [], color=col, lw=1.5,
-                                 label="|ψ(x,0)|² (scaled)" if k == 0 else None)
+                                 label="|ψ|² along bond" if k == 0 else None)
                 (dot,) = a.plot([], [], "o", color=col, ms=7)
                 self.cut_rhos.append(line)
                 self.cut_dots.append(dot)
-            (self.cut_e,) = a.plot([], [], ":", color="#333", lw=1.2, label="electron energy")
+            (self.cut_e,) = a.plot([], [], ":", color="#333", lw=1.2, label="energy")
             a.set_xlim(-VIEW_HALF_WIDTH, VIEW_HALF_WIDTH)
             a.legend(fontsize=8, loc="lower left", bbox_to_anchor=(0, 1.0), ncol=3,
                      frameon=False, handlelength=1.5, columnspacing=1.0)
@@ -956,7 +1121,7 @@ def run_app(root=None, mainloop=True):
                      frameon=False, handlelength=1.5, columnspacing=1.0)
 
             a = self.ax_in
-            a.set_xlabel("time (fs)")
+            a.tick_params(labelbottom=False)
             a.set_ylabel("inside σ")
             a.set_ylim(-0.05, 1.08)
             self.l_in = [a.plot([], [], color=col, lw=1.3, label=f"electron {k + 1}")[0]
@@ -964,12 +1129,17 @@ def run_app(root=None, mainloop=True):
             a.legend(fontsize=8, loc="lower left", bbox_to_anchor=(0, 1.0), ncol=2,
                      frameon=False, handlelength=1.5, columnspacing=1.0)
 
+            a = self.ax_r
+            a.set_xlabel("time (fs)")
+            a.set_ylabel("R (bohr)")
+            (self.l_r,) = a.plot([], [], color="#c92a2a", lw=1.4)
+
             # Blitting: everything that changes every frame is "animated" and redrawn
             # on top of a cached picture of the static parts (axes, ticks, labels).
             self.anim = [self.nuclei_art, *self.trails, self.ghost_trail, *self.dots,
                          self.ghost_dot, self.drag_line, self.title,
                          *self.cut_rhos, *self.cut_dots, self.cut_e,
-                         self.l_t, self.l_v, self.l_e, *self.level_lines, *self.l_in]
+                         self.l_t, self.l_v, self.l_e, *self.level_lines, *self.l_in, self.l_r]
             for art in [self.img, *self.anim]:
                 art.set_animated(True)
             self.background = None
@@ -1001,9 +1171,16 @@ def run_app(root=None, mainloop=True):
             t0, t1 = h[0, 0], h[-1, 0]
             vals = h[:, 1:4]
             lo, hi = float(np.nanmin(vals)), float(np.nanmax(vals))
-            if self.sim.count == 1:
+            if self.sim.count == 1 and not self.sim.nuclei_move:
                 for _psi, e in self._orbitals().values():
                     lo, hi = min(lo, e), max(hi, e)
+            r = h[:, 6]
+            rlo, rhi = float(r.min()), float(r.max())
+            pad = max(0.15, 0.2 * (rhi - rlo))
+            r0, r1 = self.ax_r.get_ylim()
+            if rlo < r0 or rhi > r1 or (rhi - rlo + 2 * pad) < 0.4 * (r1 - r0):
+                self.ax_r.set_ylim(rlo - pad, rhi + pad)
+                self.need_full_draw = True
             x0, x1 = ax.get_xlim()
             y0, y1 = ax.get_ylim()
             span = max(hi - lo, 0.2)
@@ -1014,8 +1191,9 @@ def run_app(root=None, mainloop=True):
                 ax.set_ylim(lo - 0.15 * span, hi + 0.35 * span)
                 self.need_full_draw = True
 
-        def _draw_molecule(self):
+        def _draw_molecule(self, rescale=True):
             s = self.sys
+            self.drawn_geom = (s.x1, s.x2)
             if self.contours is not None:
                 self.contours.remove()
             levels = np.linspace(s.V.min() * 0.9, -0.15, 9)
@@ -1025,14 +1203,15 @@ def run_app(root=None, mainloop=True):
             self.nuclei_art.set_offsets([(xn, 0) for xn, _ in s.nuclei])
             self.nuclei_art.set_sizes([60 + 60 * z for _, z in s.nuclei])
             self.cut_v.set_ydata(s.V[s.n // 2])
-            self.ax_cut.set_ylim(s.V.min() - 0.3, 1.0)
-            self.need_full_draw = True
+            if rescale:
+                self.ax_cut.set_ylim(s.V.min() - 0.3, 1.0)
+                self.need_full_draw = True
 
         def _orbitals(self):
-            if self.orbital_version != self.sys.version:
+            if self.orbital_version != self.sys.params_version:
                 self.orbitals = {}
                 self.region = None
-                self.orbital_version = self.sys.version
+                self.orbital_version = self.sys.params_version
                 if self.region_art is not None:
                     self.region_art.remove()
                     self.region_art = None
@@ -1047,14 +1226,35 @@ def run_app(root=None, mainloop=True):
                 q = self.sim.electrons[0].wave
                 orb[0] = q.solve_state(q.lcao(+1))
             if self.region is None:
-                s = self.sys
-                psi = orb[0][0]
-                self.region = orbital_region(psi, s.dA)
-                self.region_art = self.ax.contour(s.X, s.Y, np.abs(psi) ** 2, levels=[self.region[1]],
-                                                  colors="white", linewidths=1.0,
-                                                  linestyles="--", alpha=0.8)
-                self.region_art.set_animated(True)
+                self._set_region(orb[0][0])
             return orb[0]
+
+        def _set_region(self, psi):
+            s = self.sys
+            self.region = orbital_region(psi, s.dA)
+            if self.region_art is not None:
+                self.region_art.remove()
+            self.region_art = self.ax.contour(s.X, s.Y, np.abs(psi) ** 2, levels=[self.region[1]],
+                                              colors="white", linewidths=1.0,
+                                              linestyles="--", alpha=0.8)
+            self.region_art.set_animated(True)
+
+        def _follow_nuclei(self):
+            """While the nuclei move: keep the sigma orbital matched to them (a few
+            imaginary-time steps per frame), and redraw the potential and the 90 %
+            boundary whenever the nuclei have moved noticeably."""
+            s = self.sys
+            orb = self._orbitals()
+            orb.pop(1, None)                       # sigma* is not tracked while vibrating
+            q = self.sim.electrons[0].wave
+            if 0 in orb:
+                orb[0] = (q.imag_steps(orb[0][0], SIGMA_TRACK_STEPS), orb[0][1])
+            moved = max(abs(s.x1 - self.drawn_geom[0]), abs(s.x2 - self.drawn_geom[1]))
+            if moved > 0.03:
+                if 0 in orb:
+                    orb[0] = (orb[0][0], q.energy(orb[0][0]))
+                    self._set_region(orb[0][0])
+                self._draw_molecule(rescale=False)
 
         # ------------------------------------------------------------------
         # State changes
@@ -1066,6 +1266,7 @@ def run_app(root=None, mainloop=True):
             self.sys.set_params(p["R"], p["Z1"], p["Z2"], p["soft"])
             self.sim.rebuild()
             self.sim.set_absorb(self.flags["absorb"].get())
+            self.sim.nuc_p = [0.0, 0.0]
             self.sim.t = 0.0
             self.history = deque(maxlen=HISTORY_LEN)
             self.clouds = [np.zeros((self.sys.n, self.sys.n)) for _ in range(2)]
@@ -1229,7 +1430,8 @@ def run_app(root=None, mainloop=True):
                 e1, e2 = self.sim.electrons
                 if e1.mode == "particle":
                     c = e1.particle
-                    self.place(1, (-c.x, -c.y), (-c.px, -c.py), as_wave=False)
+                    xc = (self.sys.x1 + self.sys.x2) / 2     # centre of the molecule
+                    self.place(1, (2 * xc - c.x, -c.y), (-c.px, -c.py), as_wave=False)
                 else:
                     self.place(1, (0.0, 0.0), (0.0, 0.0), as_wave=True)
                     e2.wave.psi = e1.wave.psi[::-1, ::-1].copy()
@@ -1245,6 +1447,7 @@ def run_app(root=None, mainloop=True):
             v = self.vars
             self.sys.set_params(v["R"].get(), v["Z1"].get(), v["Z2"].get(), v["soft"].get())
             self.sim.rebuild()
+            self.sim.nuc_p = [0.0, 0.0]          # nuclei restart at rest at the new R
             if self.ghost is not None:
                 self.ghost.refresh_force()
             for c in self.clouds:
@@ -1253,7 +1456,26 @@ def run_app(root=None, mainloop=True):
             self.region_dirty_since = time.time()
             self._draw_molecule()
 
+        def on_mass(self):
+            self.sim.nuclear_mass = float(self.vars["mass"].get())
+
         def on_flag(self):
+            vib = self.flags["vibrate"].get()
+            if vib != self.sim.nuclei_move:
+                self.sim.nuclei_move = vib
+                self.sim.nuc_p = [0.0, 0.0]
+                self.on_mass()
+                self.history.clear()              # the energy now does / does not include the nuclei
+                self.need_full_draw = True
+                if vib:
+                    self._orbitals().pop(1, None)
+                    self.message = ("Nuclei now move along the bond. The electrons pull them together and they "
+                                    "repel each other; start away from the balance point (R slider) to see a "
+                                    "vibration. With the real H mass one vibration takes ~10 fs (thousands of "
+                                    "frames): lower the nuclear mass or raise the speed to watch it sooner.")
+                else:
+                    self.vars["R"].set(round(self.sys.R, 2))
+                    self.message = f"Nuclei fixed again at R = {self.sys.R:.3f} bohr."
             self.sim.set_absorb(self.flags["absorb"].get())
             if not self.flags["cloud"].get():
                 for c in self.clouds:
@@ -1340,6 +1562,8 @@ def run_app(root=None, mainloop=True):
                 if self.ghost is not None:
                     self.ghost.step(DT)
             self.last_dt = steps * DT
+            if self.sim.nuclei_move:
+                self._follow_nuclei()
 
             if self.flags["auto"].get():
                 if self.rng.random() < 1 - math.exp(-self.vars["rate"].get() * steps * DT):
@@ -1402,6 +1626,7 @@ def run_app(root=None, mainloop=True):
             sigma = self._orbitals().get(0)
 
             self.img.set_data(self._make_image(infos))
+            self.nuclei_art.set_offsets([(xn, 0) for xn, _ in s.nuclei])
             inside, lines = [np.nan, np.nan], []
             for i in range(2):
                 if i >= len(infos):
@@ -1476,6 +1701,8 @@ def run_app(root=None, mainloop=True):
 
             modes = ["wave" if inf["mode"] == "wave" else "particle" for inf in infos]
             state = "relaxing" if self.relaxing else ("Schrödinger eq." if "wave" in modes else "Newton")
+            if self.sim.nuclei_move and not self.relaxing:
+                state += ", nuclei vibrating"
             if two:
                 self.title.set_text(f"Two electrons: e₁ {modes[0]}, e₂ {modes[1]}  ({state})")
                 self.mode_var.set("  ".join(f"e{k + 1}: {m.upper()}" for k, m in enumerate(modes)))
@@ -1486,16 +1713,17 @@ def run_app(root=None, mainloop=True):
 
             # histories
             if self.relaxing is None and self.last_dt > 0:
-                self.history.append((self.sim.t * AU_TIME_FS, obs["T"], obs["V"], obs["E"], *inside))
+                self.history.append((self.sim.t * AU_TIME_FS, obs["T"], obs["V"], obs["E"], *inside, s.R))
             if self.history:
                 h = np.array(self.history)
                 for line, col in ((self.l_t, 1), (self.l_v, 2), (self.l_e, 3)):
                     line.set_data(h[:, 0], h[:, col])
                 for k, line in enumerate(self.l_in):
                     line.set_data(h[:, 0], h[:, 4 + k])
+                self.l_r.set_data(h[:, 0], h[:, 6])
                 orb = self._orbitals()
                 for k, line in enumerate(self.level_lines):
-                    level = orb[k][1] if (k in orb and not two) else np.nan
+                    level = orb[k][1] if (k in orb and not two and not self.sim.nuclei_move) else np.nan
                     line.set_ydata([level, level])
                 self._update_energy_limits(h)
 
@@ -1503,6 +1731,8 @@ def run_app(root=None, mainloop=True):
             head = f"t = {self.sim.t * AU_TIME_FS:7.3f} fs   E = {e:8.4f} Ha ({e * HARTREE_EV:7.2f} eV)"
             if two:
                 head += f"   electron repulsion V_ee = {obs['Vee']:.4f} Ha"
+            if self.sim.nuclei_move:
+                head += f"   R = {s.R:.3f} bohr   nuclear KE = {obs['Tnuc']:.5f} Ha"
             orb = self._orbitals()
             levels = "  ".join(f"E_{nm} = {orb[k][1]:.4f}" for k, nm in ((0, "σ"), (1, "σ*"))
                                if k in orb)

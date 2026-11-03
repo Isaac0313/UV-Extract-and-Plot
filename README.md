@@ -32,7 +32,8 @@ between the two at any moment. The question it answers: *given a starting positi
 - **Auto switch**: random measure / become-wave events at a chosen rate.
 - **Classical ghost** (one electron): a classical electron runs alongside the wave packet so you can compare the two motions.
 - **Classical cloud**: the time-averaged position of a particle, to compare with |ψ|².
-- Sliders for bond length R, nuclear charges Z₁ and Z₂, softening a, wave packet width and speed.
+- **Nuclei vibrate**: the nuclei move along the bond, pushed apart by their repulsion and pulled together by the electrons (point charges or charge clouds). A plot shows the bond length R(t). The nuclear-mass slider (hydrogen = 1836 electron masses) can make them lighter so the vibration (~10 fs for real H) is quicker to watch.
+- Sliders for bond length R, nuclear charges Z₁ and Z₂, softening a, nuclear mass, wave packet width and speed.
 - Click the plot to place an electron, drag to give it a velocity.
 
 ## How two electrons interact
@@ -50,10 +51,11 @@ python MO-Electron-Simulator.py
 ```bash
 python MO-Electron-Simulator.py --selftest
 ```
-`--selftest` runs physics checks without opening a window (energy and norm conservation for one and two electrons, orbital symmetry, measurement statistics, the two-electron ground state).
+`--selftest` runs physics checks without opening a window (energy and norm conservation for one and two electrons, orbital symmetry, measurement statistics, the two-electron ground state, forces on the nuclei, energy conservation with vibrating nuclei).
 
 ## Model assumptions
 - Atomic units (bohr, hartree, a.u. of time = 0.0242 fs).
 - 2D: the electrons move in the plane that contains both nuclei.
 - Soft-core Coulomb interactions 1 / √(d² + a²) (electron–nucleus and electron–electron) so the grid and Newton's equations stay well behaved.
-- Nuclei are fixed (Born–Oppenheimer). Because of the 2D geometry and softening, energies differ from real 3D H2+ / H2.
+- Nuclei are fixed (Born–Oppenheimer) unless "Nuclei vibrate" is on; then they are classical point masses moving along the bond axis (no rotation).
+- Because of the 2D geometry and softening, energies and bond lengths differ from real 3D H2+ / H2.
