@@ -124,3 +124,15 @@ Results on a 4-core CPU (R = 2 bohr, default settings):
 
 The network recovers 99.9% of the correlation energy (exact − mean field = 0.052 Ha). For H2+ it matches the grid solver to within 0.0001 Ha after 600 iterations.
 
+Energy vs bond length (`--curve 1.0,1.5,2.0,3.0,4.0`, total energies including nuclear repulsion, about 20 minutes on a 4-core CPU):
+
+| R (bohr) | Neural network | Exact (4D grid) | Mean field |
+|---|---|---|---|
+| 1.0 | −1.32165 ± 0.00003 | −1.32164 | −1.28879 |
+| 1.5 | −1.44566 ± 0.00003 | −1.44566 | −1.40507 |
+| 2.0 | −1.43229 ± 0.00003 | −1.43229 | −1.38028 |
+| 3.0 | −1.35676 ± 0.00002 | −1.35680 | −1.26653 |
+| 4.0 | −1.32046 ± 0.00002 | −1.32049 | −1.17497 |
+
+Mean field gets worse as the bond stretches (0.15 Ha too high at R = 4: it forces both electrons into one shared orbital, while really each electron goes to its own atom). The network stays within 0.00004 Ha of the exact answer at every bond length. The exact grid values carry their own discretization error of about 0.00002 Ha.
+
