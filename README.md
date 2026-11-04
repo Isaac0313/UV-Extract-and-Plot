@@ -91,3 +91,36 @@ python MO-Electron-Simulator-JAX.py --selftest
 - Soft-core Coulomb interactions 1 / √(d² + a²) (electron–nucleus and electron–electron) so the grid and Newton's equations stay well behaved.
 - Nuclei are fixed (Born–Oppenheimer) unless "Nuclei vibrate" is on; then they are classical point masses moving along the bond axis (no rotation).
 - Because of the 2D geometry and softening, energies and bond lengths differ from real 3D H2+ / H2.
+
+# Neural-network wavefunction solver (`mo_nn_solver.py`)
+Finds the ground state of the simulator's molecule (one or two electrons, same 2D soft-core model) with a neural network as the wavefunction, trained by variational Monte Carlo in JAX: the method behind FermiNet / PauliNet, sized for this model.
+
+- **Wavefunction**: ψ(r₁, r₂) = exp(f), f = exponential envelope around the nuclei + a neural network. It is built so that swapping the electrons leaves ψ unchanged (spin singlet), which is what the ground state of two opposite-spin electrons needs.
+- **Energy**: the average of the local energy E_L = Hψ/ψ over electron positions sampled from |ψ|² (Metropolis). JAX computes the derivatives in E_L exactly.
+- **Training**: Adam on the energy gradient 2⟨(E_L − E) ∂ log ψ⟩. The variational principle keeps the energy above the true ground state, and E_L becomes constant (zero variance) for the exact state, so the variance shows how good the network is.
+- **Answer keys**: one electron is checked against the simulator's grid solver; two electrons against mean field (what the simulator's "Relax both" gives, which misses electron correlation) and against an exact solution on a full 4D grid (x₁, y₁, x₂, y₂), which is affordable only because this model is 2D with two electrons.
+
+```bash
+python mo_nn_solver.py
+```
+```bash
+python mo_nn_solver.py --electrons 1
+```
+```bash
+python mo_nn_solver.py --curve 1.0,1.5,2.0,3.0,4.0
+```
+```bash
+python mo_nn_solver.py --selftest
+```
+Options: `--R`, `--Z1`, `--Z2`, `--soft`, `--iterations`, `--walkers`, `--hidden`, `--seed`, `--out DIR` (plots, default `nn_results/`), `--no-exact` (skip the 4D grid), `--fp32` (single precision; use on GPUs).
+
+Results on a 4-core CPU (R = 2 bohr, default settings):
+
+| Method | H2 energy (Ha) |
+|---|---|
+| Mean field (shared orbital) | −1.880275 |
+| Neural network (3000 iterations, ~2 min) | −1.932252 ± 0.000019 |
+| Exact, 4D grid (dx 0.30 bohr) | −1.932287 |
+
+The network recovers 99.9% of the correlation energy (exact − mean field = 0.052 Ha). For H2+ it matches the grid solver to within 0.0001 Ha after 600 iterations.
+
