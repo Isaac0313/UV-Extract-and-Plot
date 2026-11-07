@@ -17,6 +17,11 @@
 ## Main Use
 - Averaging groups of data set to determine overall prefomance of a type of material.
 
+# Opening in VS Code
+1. *File → Open Folder* and pick this folder. Accept the suggested Python extension.
+2. *Ctrl+Shift+P → Python: Create Environment → Venv*, and tick `requirements.txt` so everything is installed. Or, in VS Code's terminal: `python -m pip install -r requirements.txt`.
+3. Open *Run and Debug* (Ctrl+Shift+D), pick a program from the list (simulators, neural-network runs, self-tests, UV-Vis plotter) and press F5.
+
 # MO Electron Simulator (`MO-Electron-Simulator.py`)
 A separate, standalone program: one or two electrons moving between two nuclei (an H2+ / H2-like molecule).
 Each electron can be a **classical particle** (pushed around by the Coulomb forces of the nuclei and the other electron)

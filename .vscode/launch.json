@@ -1,0 +1,75 @@
+{
+    // Run and Debug menu (Ctrl+Shift+D): pick a program and press F5.
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "MO simulator (pyqtgraph, fastest)",
+            "type": "debugpy", "request": "launch",
+            "program": "${workspaceFolder}/MO-Electron-Simulator-Qt.py",
+            "args": ["--jax"], "cwd": "${workspaceFolder}", "console": "integratedTerminal"
+        },
+        {
+            "name": "MO simulator (tkinter, NumPy)",
+            "type": "debugpy", "request": "launch",
+            "program": "${workspaceFolder}/MO-Electron-Simulator.py",
+            "cwd": "${workspaceFolder}", "console": "integratedTerminal"
+        },
+        {
+            "name": "MO simulator (tkinter, JAX)",
+            "type": "debugpy", "request": "launch",
+            "program": "${workspaceFolder}/MO-Electron-Simulator-JAX.py",
+            "cwd": "${workspaceFolder}", "console": "integratedTerminal"
+        },
+        {
+            "name": "Neural network: quick H2 test (~30 s)",
+            "type": "debugpy", "request": "launch",
+            "program": "${workspaceFolder}/mo_nn_solver.py",
+            "args": ["--iterations", "300", "--no-exact"],
+            "cwd": "${workspaceFolder}", "console": "integratedTerminal"
+        },
+        {
+            "name": "Neural network: H2 vs exact (~4 min)",
+            "type": "debugpy", "request": "launch",
+            "program": "${workspaceFolder}/mo_nn_solver.py",
+            "cwd": "${workspaceFolder}", "console": "integratedTerminal"
+        },
+        {
+            "name": "Neural network: H2+ (1 electron)",
+            "type": "debugpy", "request": "launch",
+            "program": "${workspaceFolder}/mo_nn_solver.py",
+            "args": ["--electrons", "1", "--iterations", "600"],
+            "cwd": "${workspaceFolder}", "console": "integratedTerminal"
+        },
+        {
+            "name": "Neural network: bond curve (~20 min)",
+            "type": "debugpy", "request": "launch",
+            "program": "${workspaceFolder}/mo_nn_solver.py",
+            "args": ["--curve", "1.0,1.5,2.0,3.0,4.0"],
+            "cwd": "${workspaceFolder}", "console": "integratedTerminal"
+        },
+        {
+            "name": "Self-tests: physics (NumPy)",
+            "type": "debugpy", "request": "launch",
+            "program": "${workspaceFolder}/mo_physics.py",
+            "cwd": "${workspaceFolder}", "console": "integratedTerminal"
+        },
+        {
+            "name": "Self-tests: physics (JAX)",
+            "type": "debugpy", "request": "launch",
+            "program": "${workspaceFolder}/mo_physics_jax.py",
+            "cwd": "${workspaceFolder}", "console": "integratedTerminal"
+        },
+        {
+            "name": "Self-tests: neural network",
+            "type": "debugpy", "request": "launch",
+            "program": "${workspaceFolder}/mo_nn_solver.py",
+            "args": ["--selftest"], "cwd": "${workspaceFolder}", "console": "integratedTerminal"
+        },
+        {
+            "name": "UV-Vis plotter",
+            "type": "debugpy", "request": "launch",
+            "program": "${workspaceFolder}/UVVis-Plot Software.py",
+            "cwd": "${workspaceFolder}", "console": "integratedTerminal"
+        }
+    ]
+}

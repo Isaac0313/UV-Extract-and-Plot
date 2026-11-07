@@ -1,0 +1,14 @@
+# Install everything with:  python -m pip install -r requirements.txt
+# (tkinter comes with the python.org installer; on Linux: sudo apt install python3-tk)
+
+# MO Electron Simulator + neural-network solver
+numpy
+matplotlib
+jax            # JAX physics and the neural-network solver (NVIDIA GPU: pip install "jax[cuda12]")
+pyqtgraph      # MO-Electron-Simulator-Qt.py
+PyQt6          # Qt for pyqtgraph
+
+# UV-Vis plotter (UVVis-Plot Software.py)
+pandas
+openpyxl
+scipy
