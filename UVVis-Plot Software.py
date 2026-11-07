@@ -22,6 +22,7 @@ Where the data lives (all in memory, nothing is written unless you export):
     self.log       every function applied (export it with "Export function log")
 """
 
+import contextlib
 import copy
 import os
 import sys
@@ -340,12 +341,21 @@ def multi_tauc(ws, keys, value, kind):
                 raise ValueError(f"'{key}' has X values from {it['x'].min():g}, which doesn't "
                                  f"look like wavelength in nm (wavenumber in cm^-1?). "
                                  f"The Tauc plot needs wavelength in nm.")
-            e = HC_EV_NM / it["x"]
-            t = np.clip(it["y"] * e, 0, None) ** TAUC_POWER[kind]
-            order = np.argsort(e)
-            e, t = e[order], t[order]
-            name = ws.new_item(f"{key} Tauc {kind}", e, t, tauc=kind)
-            ws.details.append(dict(item=key, result=f"created '{name}'"))
+            src = hash((it["x"].tobytes(), it["y"].tobytes()))
+            made = [k for k, o in ws.items.items()
+                    if o.get("tauc") == kind and o.get("tauc_src") == src]
+            if made:                            # already plotted from this data: reuse it
+                name = made[0]
+                e, t = ws.items[name]["x"], ws.items[name]["y"]
+                ws.details.append(dict(item=key, result=f"uses existing '{name}'"))
+            else:
+                e = HC_EV_NM / it["x"]
+                t = np.clip(it["y"] * e, 0, None) ** TAUC_POWER[kind]
+                order = np.argsort(e)
+                e, t = e[order], t[order]
+                name = ws.new_item(f"{key} Tauc {kind}", e, t, tauc=kind)
+                ws.items[name]["tauc_src"] = src
+                ws.details.append(dict(item=key, result=f"created '{name}'"))
         if not rng:
             continue
 
@@ -518,7 +528,14 @@ class WorkingSet:
         except Exception:
             self.items = self._history.pop()[0]   # roll back
             raise
+        if self._unchanged(self._history[-1][0]):  # report only: no Undo step
+            self._history.pop()
         return report
+
+    def _unchanged(self, old):
+        return old.keys() == self.items.keys() and all(
+            np.array_equal(old[k]["x"], it["x"]) and np.array_equal(old[k]["y"], it["y"])
+            and old[k]["ops"] == it["ops"] for k, it in self.items.items())
 
     def to_frame(self):
         """Table for export: an X and a Y column per item (X ranges can differ)."""
@@ -548,8 +565,49 @@ def _fix_decimal_commas(df):
     return df
 
 
-def load_tables(path):
-    """Read a file and return {sheet_name: DataFrame}."""
+def _paired_layout(df):
+    """Does the sheet give every sample its own X column? Returns
+    (sample names, X column title, header rows to skip) or None.
+      - instrument exports (e.g. Cary): sample names over column pairs, then a
+        row like "Wavelength (nm) | Abs | Wavelength (nm) | Abs"
+      - this program's exports: "<name> X | <name> Y | ..." """
+    cols = list(df.columns)
+    if len(cols) < 4 or len(cols) % 2:
+        return None
+    if all(cols[i].endswith(" X") and cols[i + 1] == cols[i][:-2] + " Y"
+           for i in range(0, len(cols), 2)):
+        return [c[:-2] for c in cols[::2]], "X", 0
+    first = [str(v).strip() for v in df.iloc[0]] if len(df) else []
+    if first and all("wavelength" in first[i].lower() or "nm" in first[i].lower()
+                     for i in range(0, len(cols), 2)) \
+            and all(pd.isna(pd.to_numeric(df.iloc[0, i], errors="coerce"))
+                    for i in range(1, len(cols), 2)):
+        return [str(c) for c in cols[::2]], first[0], 1
+    return None
+
+
+def _merge_pairs(df, names, x_title):
+    """One shared X column (all the samples' X values) plus a Y column per
+    sample; a sample is blank at X values it doesn't have."""
+    series, used = [], []
+    for i, name in enumerate(names):
+        x = pd.to_numeric(df.iloc[:, 2 * i], errors="coerce")
+        y = pd.to_numeric(df.iloc[:, 2 * i + 1], errors="coerce")
+        ok = x.notna()
+        label, n = name, 2
+        while label in used or label == x_title:
+            label, n = f"{name} #{n}", n + 1
+        used.append(label)
+        part = pd.Series(y[ok].to_numpy(), index=x[ok].to_numpy(), name=label)
+        series.append(part[~part.index.duplicated()])
+    merged = pd.concat(series, axis=1).sort_index()
+    merged.index.name = x_title
+    return merged.reset_index()
+
+
+def load_tables(path, empty=None):
+    """Read a file and return {sheet_name: DataFrame}. Named columns that
+    hold no data at all are left out and listed in 'empty' (if given)."""
     ext = os.path.splitext(path)[1].lower()
     if ext in (".csv", ".txt", ".tsv"):
         # sep=None lets pandas work out commas vs tabs vs semicolons
@@ -559,6 +617,10 @@ def load_tables(path):
 
     cleaned = {}
     for name, df in tables.items():
+        if empty is not None:                   # e.g. Excel formulas with no stored values
+            empty += [f"{c}  (sheet '{name}')" if len(tables) > 1 else str(c)
+                      for c in df.columns[df.isna().all()]
+                      if not str(c).startswith("Unnamed:")]
         df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
         names = []
         for c in df.columns:
@@ -568,7 +630,12 @@ def load_tables(path):
                 name_, n = f"{base} #{n}", n + 1
             names.append(name_)
         df.columns = names
+        paired = _paired_layout(df)
+        if paired:
+            df = df.iloc[paired[2]:]            # drop the "Wavelength | Abs" row
         df = _fix_decimal_commas(df)
+        if paired:
+            df = _merge_pairs(df, paired[0], paired[1])
         if df.shape[1] >= 2 and len(df) > 0:
             cleaned[str(name)] = df
     return cleaned
@@ -698,6 +765,8 @@ class App(tk.Tk):
         self.y_list.config(selectbackground="#cfe0f5", selectforeground="black")
         self.y_list.bind("<<ListboxSelect>>", lambda e: self.redraw())
         self.y_list.bind("<Double-Button-1>", self._double_click_column)
+        # a click below the last name would toggle the last column: ignore it
+        self.y_list.bind("<Button-1>", lambda e: "break" if self._row_at(e.y) is None else None)
         # a square after each name showing its line colour; click it to change
         self.swatches = tk.Canvas(self.y_list.master, width=16, highlightthickness=0,
                                   bd=0, bg=self.y_list.cget("bg"), cursor="hand2")
@@ -846,6 +915,7 @@ class App(tk.Tk):
         self._drawn = {}                      # view each graph had when last drawn
         self._auto = {}                       # its automatic / typed view (what Home gives)
         self._zoom = {}                       # toolbar zoom or pan to keep across redraws
+        self._typed = {}                      # typed axis ranges at the last draw
         self.ax.text(0.5, 0.5, "Open a file to begin", ha="center", va="center",
                      color="#888", fontsize=14, transform=self.ax.transAxes)
         self.ax.set_axis_off()
@@ -867,8 +937,10 @@ class App(tk.Tk):
             self.open_file(path)
 
     def open_file(self, path):
+        empty = []
         try:
-            tables = load_tables(path)
+            with self._busy():
+                tables = load_tables(path, empty)
         except Exception as err:
             messagebox.showerror("Could not open file", str(err))
             return
@@ -877,6 +949,18 @@ class App(tk.Tk):
                 "Nothing to plot",
                 "No sheet with at least two columns of data was found.")
             return
+        if self.ws.items and not messagebox.askokcancel(
+                "Open another file",
+                f"Opening '{os.path.basename(path)}' clears the working list "
+                f"({len(self.ws.items)} item(s)). Anything not exported is lost.\n\n"
+                f"Continue?", icon="warning"):
+            return
+        if empty:
+            messagebox.showwarning(
+                "Empty columns",
+                "These columns have a name but no values, so they were left out:\n"
+                + "\n".join(empty) + "\n\nIf they are Excel formulas, open the file in "
+                "Excel and save it once so the results are stored, then open it again.")
 
         self.tables = tables
         self.ws = WorkingSet()                # new file -> empty working list
@@ -969,9 +1053,8 @@ class App(tk.Tk):
 
     def _swatch_click(self, event):
         """Click a column's square to pick a colour for that one column."""
-        i = self.y_list.nearest(event.y)
-        box = self.y_list.bbox(i) if self.y_names else None
-        if not box or not box[1] <= event.y <= box[1] + box[3]:
+        i = self._row_at(event.y)
+        if i is None:
             return
         col = self.y_names[i]
         key = self.key_for(col)
@@ -980,18 +1063,25 @@ class App(tk.Tk):
                                       or self._line_colors.get(col), parent=self)[1]
         if not color:
             return
-        self.colors[key] = color
-        self.group_names.setdefault(color, col)   # its name in the grouped legend
+        self.colors[key] = color                  # its own colour, not a named group
         self.log_event("Colour", item=col, result=color)
         self.refresh_available()
         self.redraw()
 
+    def _row_at(self, y):
+        """Index of the Y column under the mouse, or None over empty space."""
+        if not self.y_names:
+            return None
+        i = self.y_list.nearest(y)
+        box = self.y_list.bbox(i)
+        return i if box and box[1] <= y <= box[1] + box[3] else None
+
     def _double_click_column(self, event):
         """Double-click a Y column to rename it. The first click of the pair
         toggled it on or off the graph, so toggle it back first."""
-        if not self.y_names:
+        i = self._row_at(event.y)
+        if i is None:
             return
-        i = self.y_list.nearest(event.y)
         if self.y_list.selection_includes(i):
             self.y_list.selection_clear(i)
         else:
@@ -1249,11 +1339,22 @@ class App(tk.Tk):
             text += "\nX must be wavelength in nm."
         self.target_label.config(text=text)
 
+    @contextlib.contextmanager
+    def _busy(self):
+        """Hourglass cursor while something slow runs (the window can't respond)."""
+        self.config(cursor="watch")
+        self.update_idletasks()
+        try:
+            yield
+        finally:
+            self.config(cursor="")
+
     def apply_function(self):
         name = self.func_var.get()
         keys = self.selected_work_keys() or self.ws.keys()
         try:
-            report = self.ws.apply(name, keys, self.value_var.get())
+            with self._busy():
+                report = self.ws.apply(name, keys, self.value_var.get())
         except Exception as err:
             messagebox.showerror("Could not apply", str(err))
             return
@@ -1283,12 +1384,12 @@ class App(tk.Tk):
         x_col = self.x_box.get()
         series = [(c, self.df[x_col], self.df[c], "original", self.colors.get(self.key_for(c)))
                   for c in (self.y_names[i] for i in self.y_list.curselection())]
-        if self.group_legend_var.get():       # one legend entry per colour group
+        if self.group_legend_var.get():       # one legend entry per named colour group
             shown = set()
             for i, (c, x, y, look, color) in enumerate(series):
-                if color:
+                if color in self.group_names:     # made with "Colour group..."
                     # labels starting with "_" are left out of the legend
-                    label = "_" + c if color in shown else self.group_names.get(color, c)
+                    label = "_" + c if color in shown else self.group_names[color]
                     series[i] = (label, x, y, look, color)
                     shown.add(color)
         work = [(self.ws.label(k), it["x"], it["y"],
@@ -1347,16 +1448,19 @@ class App(tk.Tk):
                     self._zoom[name] = view
 
     def _keep_zoom(self):
-        """Put a toolbar zoom back after redrawing (typed axis ranges win), then
-        remember the views so the next redraw can tell if they change."""
+        """Put a toolbar zoom back after redrawing, then remember the views so
+        the next redraw can tell if they change. Whichever came last wins:
+        typing a new axis range replaces a zoom, zooming after typing keeps it."""
         for name, (ax, xvars, yvars) in self._graphs().items():
             self._auto[name] = (ax.get_xlim(), ax.get_ylim(), ax.get_yscale())
+            typed = tuple(v.get().strip() for v in xvars + yvars)
+            if self._typed.get(name, typed) != typed:
+                self._zoom.pop(name, None)        # a range was typed since the zoom
+            self._typed[name] = typed
             zoom = self._zoom.get(name)
             if zoom and zoom[2] == ax.get_yscale():
-                if all(self._axis_value(v) is None for v in xvars):
-                    ax.set_xlim(zoom[0])
-                if all(self._axis_value(v) is None for v in yvars):
-                    ax.set_ylim(zoom[1])
+                ax.set_xlim(zoom[0])
+                ax.set_ylim(zoom[1])
             self._drawn[name] = (ax.get_xlim(), ax.get_ylim(), ax.get_yscale())
 
     def _set_panels(self, tauc):
@@ -1455,10 +1559,12 @@ class App(tk.Tk):
         win.geometry(f"+{self.winfo_rootx() + 320}+{self.winfo_rooty() + 60}")
 
     def reset_axes(self):
-        for var in (self.xmin_var, self.xmax_var, self.ymin_var, self.ymax_var,
-                    self.tauc_xmin_var, self.tauc_xmax_var,
-                    self.tauc_ymin_var, self.tauc_ymax_var):
+        """Spectra ranges back to automatic, Tauc ranges back to TAUC_XLIM / TAUC_YLIM."""
+        for var in (self.xmin_var, self.xmax_var, self.ymin_var, self.ymax_var):
             var.set("")
+        for var, value in zip((self.tauc_xmin_var, self.tauc_xmax_var,
+                               self.tauc_ymin_var, self.tauc_ymax_var), TAUC_XLIM + TAUC_YLIM):
+            var.set(value)
         self._drawn, self._zoom = {}, {}      # also undo any toolbar zoom
         self.redraw()
 
